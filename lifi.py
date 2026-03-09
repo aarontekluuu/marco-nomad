@@ -189,6 +189,14 @@ async def execute_quote(
     approval_addr = quote["estimate"].get("approvalAddress")
     from_token = quote["action"]["fromToken"]["address"]
     if approval_addr and from_token != NATIVE:
+        # SECURITY: Validate approval address matches known diamond
+        # A compromised API could return an attacker's address as spender
+        approval_checksum = Web3.to_checksum_address(approval_addr)
+        if known_diamond and approval_checksum.lower() != known_diamond.lower():
+            raise ValueError(
+                f"Approval address {approval_checksum} does not match known LI.FI diamond "
+                f"{known_diamond} on chain {chain_id}. Refusing to approve — possible API compromise."
+            )
         erc20 = w3.eth.contract(
             address=Web3.to_checksum_address(from_token),
             abi=ERC20_ABI,
@@ -228,12 +236,27 @@ async def execute_quote(
 
     # 2. Build TX with EIP-1559 gas if available, fallback to legacy
     nonce = await _call(w3.eth.get_transaction_count, sender, "pending")
+    # Gas limit: prefer quote's value, fallback to on-chain estimate + 20% buffer
+    quote_gas = tx.get("gasLimit", tx.get("gas"))
+    if quote_gas:
+        gas_limit = _parse_int(quote_gas)
+    else:
+        try:
+            estimated = await _call(w3.eth.estimate_gas, {
+                "from": sender,
+                "to": Web3.to_checksum_address(tx["to"]),
+                "data": tx["data"],
+                "value": _parse_int(tx.get("value", 0)),
+            })
+            gas_limit = int(estimated * 1.2)  # 20% buffer for execution variance
+        except Exception:
+            gas_limit = 500_000  # Last resort fallback
     send_tx = {
         "from": sender,
         "to": Web3.to_checksum_address(tx["to"]),
         "data": tx["data"],
         "value": _parse_int(tx.get("value", 0)),
-        "gas": _parse_int(tx.get("gasLimit", tx.get("gas", 500000))),
+        "gas": gas_limit,
         "nonce": nonce,
         "chainId": tx.get("chainId", await _call(lambda: w3.eth.chain_id)),
     }
@@ -326,6 +349,10 @@ RPC_URLS = {
     137: "https://polygon-rpc.com",
     56: "https://bsc-dataseed.binance.org",
     43114: "https://api.avax.network/ext/bc/C/rpc",
+    250: "https://rpc.ftm.tools",
+    324: "https://mainnet.era.zksync.io",
+    59144: "https://rpc.linea.build",
+    534352: "https://rpc.scroll.io",
 }
 
 

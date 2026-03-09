@@ -586,3 +586,30 @@ class TestGasFallback:
         tx = {"gasLimit": "0x61A80"}  # 400000 in hex
         gas = _parse_int(tx.get("gasLimit", tx.get("gas", 500000)))
         assert gas == 400000
+
+
+# ---------------------------------------------------------------------------
+# lifi.py — security validations
+# ---------------------------------------------------------------------------
+
+class TestSecurityValidations:
+    """Verify security checks in execute_quote."""
+
+    def test_rpc_urls_cover_all_diamond_chains(self):
+        """Every chain with a LIFI_DIAMOND entry must have an RPC URL."""
+        from lifi import LIFI_DIAMOND, RPC_URLS
+        missing = set(LIFI_DIAMOND) - set(RPC_URLS)
+        assert not missing, f"Chains with diamond but no RPC URL: {missing}"
+
+    def test_usdc_addresses_cover_rpc_chains(self):
+        """Every chain with an RPC URL should have a USDC address for bridging."""
+        from lifi import RPC_URLS
+        from wallet import USDC
+        missing = set(RPC_URLS) - set(USDC)
+        assert not missing, f"Chains with RPC but no USDC address: {missing}"
+
+    def test_diamond_address_is_consistent(self):
+        """All LIFI_DIAMOND entries should be the same CREATE2 address."""
+        from lifi import LIFI_DIAMOND
+        addresses = set(LIFI_DIAMOND.values())
+        assert len(addresses) == 1, f"Expected 1 diamond address, got {addresses}"

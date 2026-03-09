@@ -309,8 +309,31 @@ async def run_cycle():
                         log(f"  Bridge execution failed: {e}")
                         continue
 
-                # Deduct bridge cost BEFORE recording (single atomic save)
-                state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+                    # Verify received amount on destination chain
+                    dest_rpc = lifi.RPC_URLS.get(target_chain_id)
+                    if dest_rpc and tx_result["status"] == "DONE":
+                        actual = await asyncio.to_thread(
+                            wallet.check_onchain_balance,
+                            target_chain_id, wallet_addr, dest_rpc,
+                        )
+                        if actual is not None:
+                            expected_min = fresh_cost["to_amount_min"]
+                            if actual < expected_min * 0.95:
+                                log(f"  WARNING: received ${actual:.2f} < expected min ${expected_min:.2f}")
+                            else:
+                                log(f"  Verified: ${actual:.2f} received on {to_chain_name}")
+                            # Use actual balance — more accurate than estimate
+                            state["position_usd"] = round(actual, 2)
+                            cost_usd = round(move_usd - actual, 2)
+                        else:
+                            # Can't verify — fall back to estimated cost
+                            state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+                    else:
+                        state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+
+                if DEMO_MODE:
+                    # DEMO: simulate cost deduction
+                    state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
                 wallet.record_migration(
                     state, current_chain, target_chain_id, target_pool,
                     cost_usd, move.get("reason", journal_text[:100]),
