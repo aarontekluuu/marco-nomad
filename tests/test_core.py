@@ -97,6 +97,40 @@ class TestBrainJsonExtraction:
         journal = text[:json_match.start()].strip()
         assert journal == journal_part
 
+    def test_no_json_at_all_returns_hold(self):
+        """If model returns no JSON (rare), default to hold."""
+        text = "I'm thinking about things. No decision yet."
+        result = _extract_decision(text)
+        assert result["action"] == "hold"
+        assert result["moves"] == []
+
+
+# ---------------------------------------------------------------------------
+# brain.py — API error handling
+# ---------------------------------------------------------------------------
+
+class TestBrainErrorHandling:
+    """Test that brain.decide() gracefully handles API failures."""
+
+    @pytest.mark.asyncio
+    async def test_api_error_returns_hold(self):
+        """API failure should return hold with confidence 0, not crash."""
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.messages = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=Exception("rate limited"))
+
+        with patch("brain._get_client", return_value=mock_client):
+            import brain
+            result = await brain.decide(
+                {"Base": {"usdc": 100}},
+                [{"chain": "Base", "project": "aave-v3", "symbol": "USDC", "apy": 5.0}],
+            )
+        assert result["decision"]["action"] == "hold"
+        assert result["decision"]["confidence"] == 0.0
+        assert "API error" in result["journal"]
+
 
 # ---------------------------------------------------------------------------
 # lifi.py — calc_bridge_cost and _parse_int

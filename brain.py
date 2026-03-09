@@ -66,7 +66,7 @@ Respond with:
 If yields are stable and no migration makes sense, action should be "hold" with empty moves.
 Always end your response with the JSON block wrapped in ```json``` fences."""
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = os.getenv("BRAIN_MODEL", "claude-sonnet-4-20250514")
 
 # Reuse a single client across cycles (connection pooling, no per-call overhead)
 _client: anthropic.AsyncAnthropic | None = None
@@ -141,14 +141,20 @@ async def decide(
 
     message = "\n".join(context_parts)
 
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": message}],
-    )
-
-    text = response.content[0].text
+    try:
+        response = await client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": message}],
+        )
+        text = response.content[0].text
+    except Exception as e:
+        # Return safe default on API failure — don't crash the cycle
+        return {
+            "journal": f"Brain offline — API error: {e}. Holding by default.",
+            "decision": {"action": "hold", "moves": [], "confidence": 0.0, "risk_notes": f"API error: {e}"},
+        }
 
     # Parse journal and decision
     journal = text

@@ -159,7 +159,32 @@ async def run_cycle():
             if qd["cost_pct"] > MAX_BRIDGE_COST_PCT:
                 log(f"     WARNING: exceeds {MAX_BRIDGE_COST_PCT}% threshold")
 
-        # 3. Enrich candidates with bridge cost data for brain
+        # 3. Refresh current pool APY from live data (stored APY is from migration time)
+        current_pool = state.get("current_pool")
+        if current_pool:
+            pool_id = current_pool.get("pool_id")
+            live_match = next(
+                (p for p in candidates if p.get("pool") == pool_id),
+                None,
+            ) if pool_id else None
+            # Fallback: match by symbol + project + chain
+            if not live_match:
+                live_match = next(
+                    (p for p in candidates
+                     if p.get("symbol") == current_pool.get("symbol")
+                     and p.get("project") == current_pool.get("project")
+                     and p.get("chain") == current_pool.get("chain")),
+                    None,
+                )
+            if live_match:
+                old_apy = current_pool.get("apy", 0)
+                new_apy = live_match.get("apy", 0)
+                if abs(old_apy - new_apy) > 0.1:
+                    log(f"  Current pool APY updated: {old_apy:.2f}% -> {new_apy:.2f}% (live)")
+                current_pool["apy"] = new_apy
+                state["current_pool"] = current_pool
+
+        # 4. Enrich candidates with bridge cost data for brain
         for pool in candidates:
             chain_name = pool.get("chain", "")
             if chain_name in bridge_quotes:
@@ -167,11 +192,11 @@ async def run_cycle():
                 pool["bridge_cost_pct"] = bridge_quotes[chain_name]["cost_pct"]
                 pool["bridge_tool"] = bridge_quotes[chain_name]["cost"]["bridge"]
 
-        # 4. Build portfolio view using actual position size
+        # 5. Build portfolio view using actual position size
         chain_name = CHAIN_MAP.get(current_chain, f"Chain {current_chain}")
         portfolio = {chain_name: {"usdc": position_usd, "native": 0}}
 
-        # 5. Ask Marco's brain
+        # 6. Ask Marco's brain
         log("Marco is thinking...")
         journal_entries = load_journal()
         result = await brain.decide(portfolio, candidates, journal_entries[-3:], current_pool=state.get("current_pool"))
@@ -186,14 +211,14 @@ async def run_cycle():
             log(f"Risk notes: {risk_notes}")
         log(f"Journal: {journal_text[:200]}...")
 
-        # 5. Record journal entry (include risk notes if present)
+        # 7. Record journal entry (include risk notes if present)
         entry = f"[{datetime.now().isoformat()}] {journal_text}"
         if risk_notes:
             entry += f" [RISK: {risk_notes}]"
         journal_entries.append(entry)
         save_journal(journal_entries)
 
-        # 6. Execute moves if migrating (gate on confidence)
+        # 8. Execute moves if migrating (gate on confidence)
         if decision.get("action") == "migrate" and decision.get("moves") and confidence < MIN_CONFIDENCE:
             log(f"  BLOCKED: confidence {confidence:.0%} < {MIN_CONFIDENCE:.0%} threshold — holding instead")
         elif decision.get("action") == "migrate" and decision.get("moves"):
@@ -290,7 +315,7 @@ async def run_cycle():
                 )
                 log(f"  Migration recorded: -> {to_chain_name} (cost: ${cost_usd:.2f}, position now: ${state['position_usd']:.2f})")
 
-        # 7. Notify
+        # 9. Notify
         telegram_msg = (
             f"*Marco's Journal*\n"
             f"_{datetime.now().strftime('%Y-%m-%d %H:%M')}_\n\n"
