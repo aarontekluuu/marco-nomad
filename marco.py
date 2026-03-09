@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 import brain
 import lifi
+import protocols
 import wallet
 import yield_scanner
 from yield_scanner import CHAIN_MAP, CHAIN_MAP_REVERSE
@@ -416,6 +417,41 @@ async def _run_cycle_inner():
                 # Full position move — wallet model is single-chain
                 move_usd = position_usd
 
+                # Pool deposit engine: withdraw from current pool before migrating
+                protocols.ensure_loaded()
+                deposited_pool = state.get("_deposited_pool")
+                if deposited_pool and not DEMO_MODE:
+                    adapter = protocols.get_adapter(deposited_pool.get("protocol", ""))
+                    if adapter:
+                        log(f"  Withdrawing from {deposited_pool['protocol']} pool before migration...")
+                        try:
+                            rpc_url = lifi.RPC_URLS.get(current_chain)
+                            from web3 import Web3
+                            w3 = Web3(Web3.HTTPProvider(rpc_url))
+                            wallet_info = wallet.load_wallet()
+                            if wallet_info:
+                                wd_result = await adapter.withdraw(
+                                    w3, None,  # None = withdraw all
+                                    current_token_addr, wallet_addr,
+                                    wallet_info[1], current_chain,
+                                )
+                                log(f"  Withdrawn: TX {wd_result.tx_hash[:16]}...")
+                                state.pop("_deposited_pool", None)
+                                wallet.save_state(state)
+                                # Update position from on-chain balance after withdraw
+                                actual = await asyncio.to_thread(
+                                    wallet.check_onchain_balance,
+                                    current_chain, wallet_addr, rpc_url, token=current_token,
+                                )
+                                if actual is not None:
+                                    state["position_usd"] = round(actual, 2)
+                                    position_usd = state["position_usd"]
+                                    move_usd = position_usd
+                                    wallet.save_state(state)
+                                    log(f"  Post-withdraw balance: ${actual:.2f}")
+                        except Exception as e:
+                            log(f"  WARNING: Pool withdrawal failed: {e} — continuing with bridge")
+
                 # Safety check: min balance and migration cooldown
                 allowed, block_reason = wallet.can_migrate(state, cost_usd)
                 if not allowed:
@@ -652,6 +688,41 @@ async def _run_cycle_inner():
                     cost_usd, move.get("reason", journal_text[:100]),
                 )
                 log(f"  Migration recorded: -> {to_chain_name} (cost: ${cost_usd:.2f}, position now: ${state['position_usd']:.2f})")
+
+                # Pool deposit engine: deposit into new pool after migration
+                target_project = (target_pool.get("project") or "").lower()
+                adapter = protocols.get_adapter(target_project)
+                if adapter and adapter.supports_chain(target_chain_id) and not DEMO_MODE:
+                    log(f"  Depositing into {target_project} pool on {to_chain_name}...")
+                    try:
+                        dest_rpc = lifi.RPC_URLS.get(target_chain_id)
+                        from web3 import Web3
+                        w3 = Web3(Web3.HTTPProvider(dest_rpc))
+                        wallet_info = wallet.load_wallet()
+                        if wallet_info:
+                            dest_token = target_pool_token if is_swap else "USDC"
+                            dest_stable = wallet.STABLECOINS.get((target_chain_id, dest_token))
+                            dest_token_addr = dest_stable["address"] if dest_stable else wallet.USDC.get(target_chain_id)
+                            dest_decimals = dest_stable["decimals"] if dest_stable else wallet.USDC_DECIMALS
+                            deposit_amount_raw = int(state["position_usd"] * 10**dest_decimals)
+                            dep_result = await adapter.deposit(
+                                w3, deposit_amount_raw, dest_token_addr,
+                                wallet_addr, wallet_info[1], target_chain_id,
+                            )
+                            log(f"  Deposited ${dep_result.amount_deposited:.2f} into {target_project}: TX {dep_result.tx_hash[:16]}...")
+                            state["_deposited_pool"] = {
+                                "protocol": target_project,
+                                "pool_address": adapter.POOL_ADDRESSES.get(target_chain_id, ""),
+                                "receipt_token": dep_result.receipt_token,
+                                "deposited_amount": dep_result.amount_deposited,
+                                "deposited_at": datetime.now().isoformat(),
+                                "chain_id": target_chain_id,
+                            }
+                            wallet.save_state(state)
+                    except Exception as e:
+                        log(f"  WARNING: Pool deposit failed: {e} — funds are on-chain but not deposited")
+                elif DEMO_MODE and adapter and adapter.supports_chain(target_chain_id):
+                    log(f"  [DEMO] Would deposit into {target_project} pool on {to_chain_name}")
 
         # 9. Notify
         telegram_msg = (

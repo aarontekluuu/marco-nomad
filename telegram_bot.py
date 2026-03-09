@@ -77,6 +77,7 @@ class MarcoBot:
         self.app.add_handler(CommandHandler("resume", self._cmd_resume))
         self.app.add_handler(CommandHandler("withdraw", self._cmd_withdraw))
         self.app.add_handler(CommandHandler("kill", self._cmd_kill))
+        self.app.add_handler(CommandHandler("withdraw_pool", self._cmd_withdraw_pool))
         self.app.add_handler(CommandHandler("help", self._cmd_start))
         # Catch-all: ignore non-command messages silently (no prompt injection surface)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._ignore))
@@ -780,6 +781,75 @@ class MarcoBot:
             f"Migrations: {pnl['num_migrations']}",
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cmd_withdraw_pool(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Emergency withdraw from current yield pool back to raw USDC."""
+        if await self._reject_unauthorized(update):
+            return
+        from wallet import load_state, save_state, load_wallet, check_onchain_balance
+        from lifi import RPC_URLS
+        import protocols
+
+        state = load_state()
+        deposited = state.get("_deposited_pool")
+        if not deposited:
+            await update.message.reply_text("Not deposited in any pool.")
+            return
+
+        protocol = deposited.get("protocol", "?")
+        chain_id = deposited.get("chain_id")
+        await update.message.reply_text(
+            f"Withdrawing from {protocol} on chain {chain_id}..."
+        )
+
+        try:
+            protocols.ensure_loaded()
+            adapter = protocols.get_adapter(protocol)
+            if not adapter:
+                await update.message.reply_text(f"No adapter for {protocol}")
+                return
+
+            wallet_info = load_wallet()
+            if not wallet_info:
+                await update.message.reply_text("No wallet configured.")
+                return
+
+            rpc_url = RPC_URLS.get(chain_id)
+            if not rpc_url:
+                await update.message.reply_text(f"No RPC for chain {chain_id}")
+                return
+
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            wallet_addr, private_key = wallet_info
+
+            # Get current token address
+            current_token = state.get("current_token", "USDC")
+            from wallet import STABLECOINS, USDC, USDC_DECIMALS
+            stable_info = STABLECOINS.get((chain_id, current_token))
+            token_addr = stable_info["address"] if stable_info else USDC.get(chain_id)
+
+            result = await adapter.withdraw(
+                w3, None, token_addr, wallet_addr, private_key, chain_id
+            )
+
+            # Update state
+            state.pop("_deposited_pool", None)
+            # Check actual balance
+            actual = await asyncio.to_thread(
+                check_onchain_balance, chain_id, wallet_addr, rpc_url, token=current_token
+            )
+            if actual is not None:
+                state["position_usd"] = round(actual, 2)
+            save_state(state)
+
+            await update.message.reply_text(
+                f"Withdrawn from {protocol}.\n"
+                f"TX: {result.tx_hash[:20]}...\n"
+                f"Balance: ${state['position_usd']:.2f} {current_token}"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Withdraw failed: {e}")
 
     async def _cmd_kill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Emergency kill switch: pause agent + revoke all ERC20 approvals.
