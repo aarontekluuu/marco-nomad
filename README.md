@@ -86,12 +86,10 @@ LI.FI is Marco's **bridge brain** — the critical piece that makes cross-chain 
 | LI.FI Feature | How Marco Uses It |
 |---|---|
 | `/v1/quote` | Get optimal bridge route + cost for any chain pair |
-| `/v1/advanced/routes` | Compare multiple routes to find cheapest path |
 | `/v1/status` | Track bridge transaction completion with exponential backoff |
-| `/v1/chains` | Discover supported chains dynamically |
 | Cost calculation | Extract fees, gas, and spread from quote estimates |
 | Transaction execution | Sign + send bridge TX via LI.FI's transaction request |
-| Diamond validation | Verify TX destination matches known LI.FI contracts before signing |
+| Diamond validation | Verify TX destination AND approval address match known LI.FI contracts |
 
 Marco's decision engine weighs **yield spread vs. LI.FI bridge cost** — a migration only happens when the math makes sense:
 
@@ -142,15 +140,22 @@ Marco is built for real money, not just demos:
 
 - **TX simulation** — `eth_call` before signing to catch reverts without wasting gas
 - **TX destination validation** — every transaction checked against known LI.FI diamond contracts (CREATE2 deterministic: `0x1231DEB6...` on all 11 supported chains)
-- **Exact-amount approvals** — no `MAX_UINT256` approvals that could drain the wallet
+- **Approval address validation** — ERC20 approval spender verified against known diamond (prevents compromised API from draining tokens)
+- **Exact-amount approvals** — no infinite approvals that could drain the wallet
 - **EIP-1559 gas pricing** — on all transactions including approvals to reduce MEV exposure
+- **Gas estimation fallback** — `eth_estimateGas` with 20% buffer when quote lacks gasLimit
 - **Approval receipt verification** — confirms approval TX succeeded before attempting bridge TX
 - **Confidence gating** — brain must output >60% confidence to trigger a migration
-- **Position safety guards** — minimum $5 balance, 4-hour migration cooldown
+- **Bridge cost cap** — hard 2% limit on bridge cost as % of position, communicated to brain
+- **Position safety guards** — minimum $5 balance, 4-hour migration cooldown, 200-entry migration cap
 - **Quote freshness** — re-fetches bridge quote right before execution
-- **On-chain balance reconciliation** — compares tracked position with `balanceOf()` every cycle
+- **Post-bridge verification** — checks actual received amount on destination chain after bridge completes
+- **On-chain balance reconciliation** — compares tracked position with `balanceOf()` every cycle (async, non-blocking)
+- **Stale APY protection** — refreshes current pool APY from full DefiLlama dataset each cycle (not filtered subset)
 - **APY spike detection** — flags pools where current APY exceeds 5x the 30-day average
 - **Protocol trust scoring** — battle-tested protocols (Aave, Compound, Morpho, etc.) ranked higher
+- **0.5% slippage** — tight slippage for USDC-to-USDC bridges (prevents sandwich attacks)
+- **Brain API timeout** — 45s hard cutoff prevents cycle stalls on slow responses
 - **Exponential backoff** — bridge status polling backs off from 5s to 30s (not hammering LI.FI API)
 
 ## Quick Start
@@ -187,12 +192,14 @@ pytest tests/ -v
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | **Required.** Claude API key for brain |
 | `DEMO_MODE` | `true` | Simulate moves (no real transactions) |
-| `SCAN_CHAINS` | `8453,42161,10,137` | Chain IDs to scan (Base, Arb, OP, Polygon) |
+| `SCAN_CHAINS` | `8453,42161,10,137` | Chain IDs to scan (supports 11 chains including Base, Arb, OP, Polygon, BSC, Avalanche, Fantom, zkSync, Linea, Scroll) |
 | `MIN_TVL_USD` | `500000` | Skip pools under this TVL |
 | `MIN_APY` | `3.0` | Minimum APY threshold |
 | `MAX_BRIDGE_COST_PCT` | `2.0` | Max bridge cost as % of position |
 | `MIN_CONFIDENCE` | `0.6` | Brain must be this confident to migrate |
 | `POSITION_SIZE_USD` | `100` | Position size in USD |
+| `SLIPPAGE` | `0.005` | Bridge slippage tolerance (0.5% default) |
+| `BRAIN_MODEL` | `claude-sonnet-4-20250514` | Claude model for brain decisions |
 | `LOOP_INTERVAL` | `3600` | Seconds between cycles |
 | `WALLET_PRIVATE_KEY` | — | LIVE mode only. Private key for signing |
 
@@ -223,7 +230,7 @@ marco-nomad/
 ├── main.py            # Alternative entry with Telegram bot integration
 ├── demo/              # Seed data for dashboard (works without API keys)
 ├── tests/
-│   └── test_core.py   # 56 tests: bridge cost, yield filter, brain parsing, wallet
+│   └── test_core.py   # 64 tests: bridge cost, yield filter, brain parsing, wallet, security
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```
