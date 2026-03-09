@@ -57,6 +57,65 @@ STABLECOINS = {
 ALLOWED_STABLES = {"USDC", "USDT", "DAI", "USDbC", "USDC.e", "FRAX", "LUSD", "GHO", "PYUSD", "crvUSD"}
 
 
+def validate_private_key(private_key: str) -> tuple[bool, str, str]:
+    """Validate a private key and derive its address.
+
+    Returns (valid, address, error_message).
+    SECURITY: Never logs or stores the key itself — only the derived address.
+    """
+    if not private_key:
+        return False, "", "No private key provided"
+    # Strip whitespace and optional 0x prefix for validation
+    key = private_key.strip()
+    if key.startswith("0x") or key.startswith("0X"):
+        key_hex = key[2:]
+    else:
+        key_hex = key
+    # Must be exactly 64 hex characters (32 bytes)
+    if len(key_hex) != 64:
+        return False, "", f"Invalid key length: expected 64 hex chars, got {len(key_hex)}"
+    try:
+        int(key_hex, 16)
+    except ValueError:
+        return False, "", "Key contains non-hex characters"
+    # Derive address (requires web3)
+    try:
+        from eth_account import Account
+        acct = Account.from_key(key)
+        return True, acct.address, ""
+    except ImportError:
+        # Can't derive without web3, but key format is valid
+        return True, "", "web3 not installed — cannot derive address"
+    except Exception as e:
+        return False, "", f"Key derivation failed: {e}"
+
+
+def check_wallet_address_match(state: dict, private_key: str) -> tuple[bool, str]:
+    """Verify the private key matches the configured wallet address.
+
+    CRITICAL: Prevents sending funds to an address you don't control,
+    or signing TXs from a different wallet than intended.
+    """
+    valid, derived_addr, err = validate_private_key(private_key)
+    if not valid:
+        return False, f"Invalid private key: {err}"
+    if not derived_addr:
+        return True, "Cannot verify (web3 not installed)"
+    configured_addr = state.get("address", "")
+    if not configured_addr:
+        # No address configured — auto-set from key
+        state["address"] = derived_addr
+        save_state(state)
+        return True, f"Wallet address set to {derived_addr}"
+    if derived_addr.lower() != configured_addr.lower():
+        return False, (
+            f"MISMATCH: private key derives {derived_addr} but "
+            f"wallet_state has {configured_addr}. "
+            f"Refusing to sign — would lose funds."
+        )
+    return True, "Address verified"
+
+
 def load_state() -> dict:
     """Load wallet state from disk."""
     if STATE_FILE.exists():

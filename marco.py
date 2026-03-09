@@ -364,6 +364,11 @@ async def _run_cycle_inner():
                     if not private_key or not rpc_url:
                         log(f"  ABORT: Missing WALLET_PRIVATE_KEY or RPC URL for chain {current_chain}")
                         continue
+                    # SECURITY: Verify key matches wallet before every TX
+                    match_ok, match_msg = wallet.check_wallet_address_match(state, private_key)
+                    if not match_ok:
+                        log(f"  ABORT: {match_msg}")
+                        continue
                     log(f"  Executing bridge to {to_chain_name}...")
                     try:
                         tx_result = await lifi.execute_quote(
@@ -429,6 +434,23 @@ async def main():
     mode = "DEMO (simulated)" if DEMO_MODE else "LIVE (real execution)"
     log(f"Marco the Nomad waking up... Mode: {mode}")
     log(f"Chains: {SCAN_CHAINS} | Min TVL: ${MIN_TVL:,.0f} | Min APY: {MIN_APY}%")
+
+    # SECURITY: Validate wallet configuration at startup (LIVE mode only)
+    if not DEMO_MODE:
+        private_key = os.getenv("WALLET_PRIVATE_KEY")
+        if not private_key:
+            log("FATAL: WALLET_PRIVATE_KEY not set for LIVE mode. Exiting.")
+            sys.exit(1)
+        valid, _, err = wallet.validate_private_key(private_key)
+        if not valid:
+            log(f"FATAL: Invalid private key — {err}")
+            sys.exit(1)
+        state = wallet.load_state()
+        match_ok, match_msg = wallet.check_wallet_address_match(state, private_key)
+        if not match_ok:
+            log(f"FATAL: {match_msg}")
+            sys.exit(1)
+        log(f"Wallet verified: {state.get('address', '?')[:10]}...{state.get('address', '?')[-6:]}")
 
     if "--once" in sys.argv:
         await run_cycle()

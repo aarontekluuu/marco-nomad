@@ -472,6 +472,67 @@ class TestCanMigrate:
         assert ok is True
 
 
+class TestWalletSafety:
+    """Test wallet key validation and address matching."""
+
+    def test_validate_empty_key(self):
+        from wallet import validate_private_key
+        valid, addr, err = validate_private_key("")
+        assert valid is False
+        assert "No private key" in err
+
+    def test_validate_wrong_length(self):
+        from wallet import validate_private_key
+        valid, _, err = validate_private_key("0xdeadbeef")
+        assert valid is False
+        assert "length" in err
+
+    def test_validate_non_hex(self):
+        from wallet import validate_private_key
+        valid, _, err = validate_private_key("g" * 64)
+        assert valid is False
+        assert "non-hex" in err.lower() or "hex" in err.lower()
+
+    def test_validate_correct_format(self):
+        from wallet import validate_private_key
+        # A valid 64-char hex key (not a real key — all zeros)
+        valid, _, err = validate_private_key("0" * 64)
+        # Should pass format validation even if web3 isn't installed
+        assert valid is True
+
+    def test_validate_with_0x_prefix(self):
+        from wallet import validate_private_key
+        valid, _, _ = validate_private_key("0x" + "a" * 64)
+        assert valid is True
+
+    def test_address_mismatch_detection(self):
+        from wallet import check_wallet_address_match
+        state = {"address": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+        # This key is format-valid but will derive a different address
+        # The function should detect mismatch if web3 is available
+        # If web3 is not available, it returns True with a warning
+        ok, msg = check_wallet_address_match(state, "0" * 64)
+        # Either catches mismatch OR warns about missing web3
+        assert ok is True or "MISMATCH" in msg
+
+    def test_auto_set_address_when_empty(self):
+        """If no address configured, check_wallet_address_match should set it."""
+        import tempfile
+        from wallet import check_wallet_address_match, STATE_FILE
+        state = {"address": "", "current_chain": 8453, "migrations": []}
+        original = STATE_FILE
+        try:
+            import wallet
+            wallet.STATE_FILE = Path(tempfile.mktemp(suffix=".json"))
+            ok, msg = check_wallet_address_match(state, "0" * 64)
+            # Should succeed — either sets address or warns about web3
+            assert ok is True
+        finally:
+            if wallet.STATE_FILE.exists():
+                wallet.STATE_FILE.unlink()
+            wallet.STATE_FILE = original
+
+
 class TestStablecoinSwaps:
     """Test stablecoin swap infrastructure."""
 

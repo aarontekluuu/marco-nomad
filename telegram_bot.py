@@ -61,6 +61,7 @@ class MarcoBot:
         self.app.add_handler(CommandHandler("migrate", self._cmd_migrate))
         self.app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
         self.app.add_handler(CommandHandler("scan", self._cmd_scan))
+        self.app.add_handler(CommandHandler("fund", self._cmd_fund))
         self.app.add_handler(CommandHandler("help", self._cmd_start))
         # Catch-all: ignore non-command messages silently (no prompt injection surface)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._ignore))
@@ -97,6 +98,7 @@ class MarcoBot:
             "/portfolio — detailed balances\n"
             "/journal — recent decisions\n"
             "/scan — live yield scanner\n"
+            "/fund — deposit address + safety info\n"
             "/migrate — force evaluation cycle\n"
             "/help — this message",
             parse_mode="HTML",
@@ -270,6 +272,46 @@ class MarcoBot:
             await update.message.reply_text(msg, parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"Scan failed: {_escape(str(e))}")
+
+    async def _cmd_fund(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show deposit address and safety information for funding the agent wallet."""
+        if await self._reject_unauthorized(update):
+            return
+        from wallet import load_state, USDC
+        from yield_scanner import CHAIN_MAP
+        state = load_state()
+        addr = state.get("address", "")
+        chain = state.get("current_chain", 8453)
+        chain_name = CHAIN_MAP.get(chain, f"Chain {chain}")
+        token = state.get("current_token", "USDC")
+
+        if not addr:
+            await update.message.reply_text(
+                "⚠️ No wallet address configured.\n"
+                "Set WALLET_ADDRESS in .env or run in LIVE mode to auto-derive from private key."
+            )
+            return
+
+        usdc_addr = USDC.get(chain)
+        lines = [
+            "🏦 <b>Fund Marco's Wallet</b>\n",
+            f"<b>Deposit address:</b>",
+            f"<code>{_escape(addr)}</code>\n",
+            f"<b>Current chain:</b> {_escape(chain_name)} (ID: {chain})",
+            f"<b>Current token:</b> {_escape(token)}",
+            "",
+            "⚠️ <b>Safety checklist:</b>",
+            f"• Only send <b>{_escape(token)}</b> on <b>{_escape(chain_name)}</b>",
+            "• Double-check the address before sending",
+            "• Start with a small test amount",
+            "• Marco moves his <b>entire</b> position — don't over-fund",
+            "• Never share your private key with anyone",
+        ]
+        if usdc_addr:
+            lines.append(f"\n<b>{_escape(token)} contract:</b>")
+            lines.append(f"<code>{_escape(usdc_addr)}</code>")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def send_journal(self, entry: str):
         """Post a journal entry to the chat. All content escaped."""
