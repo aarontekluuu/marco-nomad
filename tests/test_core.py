@@ -1117,3 +1117,250 @@ class TestWalletBootstrap:
             w.WALLET_FILE = original_file
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# fast_brain.py — deterministic decision engine
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from fast_brain import (
+    _effective_apy,
+    _score_opportunity,
+    _calc_confidence,
+    _check_limits,
+    _build_hold_journal,
+    _build_migrate_journal,
+    decide,
+)
+
+
+def _make_opp(chain="Base", project="aave-v3", symbol="USDC", apy=8.0,
+              apyMean30d=7.0, tvlUsd=5_000_000, bridge_cost_usd=0.25,
+              bridge_cost_pct=0.25, **kwargs):
+    """Helper to build a test opportunity dict."""
+    opp = {
+        "chain": chain, "project": project, "symbol": symbol,
+        "apy": apy, "apyMean30d": apyMean30d, "tvlUsd": tvlUsd,
+        "bridge_cost_usd": bridge_cost_usd, "bridge_cost_pct": bridge_cost_pct,
+        "bridge_tool": "stargate", "_trusted": True, "_risk_score": 70,
+        "_multi_asset": False, "_apy_spike": False, "_move_type": "bridge",
+    }
+    opp.update(kwargs)
+    return opp
+
+
+def _make_pool(chain="Base", project="merkl", apy=5.0, symbol="USDC"):
+    return {"chain": chain, "project": project, "apy": apy, "symbol": symbol}
+
+
+class TestFastBrainScoring:
+    """Test the deterministic scoring model."""
+
+    def test_effective_apy_normal(self):
+        opp = _make_opp(apy=10.0, apyMean30d=8.0, _apy_spike=False)
+        assert _effective_apy(opp) == 10.0
+
+    def test_effective_apy_spike(self):
+        opp = _make_opp(apy=50.0, apyMean30d=8.0, _apy_spike=True)
+        assert _effective_apy(opp) == 8.0
+
+    def test_score_positive_spread(self):
+        opp = _make_opp(apy=10.0, bridge_cost_usd=0.01)
+        s = _score_opportunity(opp, current_apy=5.0, position_usd=100,
+                               expected_hold_days=7, min_spread_pct=1.5)
+        assert s["spread"] == 5.0
+        assert s["net_payoff"] > 0
+        assert s["break_even_days"] < float("inf")
+        assert s["min_spread_met"] is True
+
+    def test_score_negative_spread(self):
+        opp = _make_opp(apy=3.0, bridge_cost_usd=0.25)
+        s = _score_opportunity(opp, current_apy=5.0, position_usd=100,
+                               expected_hold_days=7, min_spread_pct=1.5)
+        assert s["spread"] == -2.0
+        assert s["net_payoff"] <= 0
+        assert s["min_spread_met"] is False
+
+    def test_score_rebalance_free(self):
+        opp = _make_opp(apy=8.0, bridge_cost_usd=0.5, _move_type="rebalance")
+        s = _score_opportunity(opp, current_apy=5.0, position_usd=100,
+                               expected_hold_days=7, min_spread_pct=1.5)
+        assert s["bridge_cost"] == 0
+
+    def test_trust_boost(self):
+        trusted = _make_opp(apy=15.0, _trusted=True, bridge_cost_usd=0.01)
+        untrusted = _make_opp(apy=15.0, _trusted=False, bridge_cost_usd=0.01)
+        s1 = _score_opportunity(trusted, 5.0, 100, 7, 1.5)
+        s2 = _score_opportunity(untrusted, 5.0, 100, 7, 1.5)
+        assert s1["net_payoff"] > s2["net_payoff"]
+
+    def test_lp_penalty(self):
+        single = _make_opp(apy=15.0, _multi_asset=False, bridge_cost_usd=0.01)
+        lp = _make_opp(apy=15.0, _multi_asset=True, bridge_cost_usd=0.01)
+        s1 = _score_opportunity(single, 5.0, 100, 7, 1.5)
+        s2 = _score_opportunity(lp, 5.0, 100, 7, 1.5)
+        assert s1["net_payoff"] > s2["net_payoff"]
+
+
+class TestFastBrainConfidence:
+    """Test deterministic confidence calculation."""
+
+    def test_zero_payoff(self):
+        assert _calc_confidence(0, 0.2, 50, True, 3.0) == 0.0
+
+    def test_high_payoff_trusted(self):
+        conf = _calc_confidence(1.0, 0.2, 90, True, 6.0)
+        assert conf >= 0.8
+
+    def test_low_payoff_untrusted(self):
+        conf = _calc_confidence(0.05, 0.2, 30, False, 1.0)
+        assert conf < 0.5
+
+    def test_caps_at_one(self):
+        conf = _calc_confidence(100.0, 0.2, 100, True, 10.0)
+        assert conf == 1.0
+
+
+class TestFastBrainDecision:
+    """Test the full decide() function."""
+
+    @pytest.mark.asyncio
+    async def test_clear_hold_no_spread(self):
+        pool = _make_pool(apy=10.0)
+        opps = [_make_opp(apy=8.0, bridge_cost_usd=0.25)]
+        portfolio = {"Base": {"usdc": 100}}
+        with patch.dict(os.environ, {"FAST_BRAIN": "true"}):
+            result = await decide(portfolio, opps, current_pool=pool)
+        assert result["decision"]["action"] == "hold"
+        assert result["journal"]
+
+    @pytest.mark.asyncio
+    async def test_clear_migrate_big_spread(self):
+        pool = _make_pool(apy=3.0)
+        # 47% spread on $100 over 7 days = $0.90/day * 7 = $6.30, net = $6.20 >> $0.28 threshold
+        opps = [_make_opp(chain="Arbitrum", apy=50.0, apyMean30d=48.0,
+                          bridge_cost_usd=0.10, bridge_cost_pct=0.1)]
+        portfolio = {"Base": {"usdc": 100}}
+        with patch.dict(os.environ, {"FAST_BRAIN": "true"}):
+            result = await decide(portfolio, opps, current_pool=pool)
+        assert result["decision"]["action"] == "migrate"
+        assert len(result["decision"]["moves"]) == 1
+        assert result["decision"]["moves"][0]["to_chain"] == "Arbitrum"
+        assert result["decision"]["confidence"] > 0.5
+
+    @pytest.mark.asyncio
+    async def test_bridge_cost_cap_filters(self):
+        pool = _make_pool(apy=3.0)
+        opps = [_make_opp(apy=20.0, bridge_cost_pct=5.0)]
+        portfolio = {"Base": {"usdc": 100}}
+        with patch.dict(os.environ, {"FAST_BRAIN": "true"}):
+            result = await decide(portfolio, opps, current_pool=pool,
+                                  bridge_cost_cap_pct=2.0)
+        assert result["decision"]["action"] == "hold"
+
+    @pytest.mark.asyncio
+    async def test_spike_uses_mean30d(self):
+        pool = _make_pool(apy=7.0)
+        opps = [_make_opp(apy=50.0, apyMean30d=6.0, _apy_spike=True,
+                          bridge_cost_usd=0.25)]
+        portfolio = {"Base": {"usdc": 100}}
+        with patch.dict(os.environ, {"FAST_BRAIN": "true"}):
+            result = await decide(portfolio, opps, current_pool=pool)
+        assert result["decision"]["action"] == "hold"
+
+    @pytest.mark.asyncio
+    async def test_output_format(self):
+        pool = _make_pool(apy=5.0)
+        opps = [_make_opp(apy=8.0, bridge_cost_usd=0.25)]
+        portfolio = {"Base": {"usdc": 100}}
+        with patch.dict(os.environ, {"FAST_BRAIN": "true"}):
+            result = await decide(portfolio, opps, current_pool=pool)
+        assert "journal" in result
+        assert "decision" in result
+        d = result["decision"]
+        assert "action" in d
+        assert "moves" in d
+        assert "confidence" in d
+        assert isinstance(d["moves"], list)
+        assert isinstance(d["confidence"], (int, float))
+
+    @pytest.mark.asyncio
+    async def test_min_spread_gate(self):
+        pool = _make_pool(apy=7.0)
+        opps = [_make_opp(apy=7.5, bridge_cost_usd=0.01, bridge_cost_pct=0.01)]
+        portfolio = {"Base": {"usdc": 100}}
+        with patch.dict(os.environ, {"FAST_BRAIN": "true"}):
+            result = await decide(portfolio, opps, current_pool=pool)
+        assert result["decision"]["action"] == "hold"
+
+
+class TestFastBrainJournals:
+    """Test journal template generation."""
+
+    def test_hold_journal_with_alternative(self):
+        pool = _make_pool(apy=5.0)
+        scored = {
+            "opp": _make_opp(apy=7.0),
+            "effective_apy": 7.0, "spread": 2.0,
+            "bridge_cost": 0.25, "bridge_pct": 0.25,
+            "break_even_days": 18, "net_payoff": -0.05,
+            "min_spread_met": True,
+        }
+        j = _build_hold_journal(pool, scored, 20)
+        # Journal mentions the current APY context and the best alternative
+        assert "5.0%" in j or "Base" in j
+        assert "aave-v3" in j or "7.0%" in j  # mentions the best alternative
+
+    def test_migrate_journal(self):
+        pool = _make_pool(chain="Base", apy=3.0)
+        scored = {
+            "opp": _make_opp(chain="Arbitrum", apy=10.0),
+            "effective_apy": 10.0, "spread": 7.0,
+            "bridge_cost": 0.20, "bridge_pct": 0.2,
+            "break_even_days": 4, "net_payoff": 0.5,
+        }
+        j = _build_migrate_journal(pool, scored)
+        assert "LI.FI" in j
+        # Should mention either the target chain, spread, or APY context
+        assert any(x in j for x in ["Arbitrum", "7.0%", "10.0%", "Base"])
+
+    def test_hold_journal_no_alternative(self):
+        pool = _make_pool(apy=5.0)
+        j = _build_hold_journal(pool, None, 10)
+        # Should contain some hold language, varies by random phrase
+        assert len(j) > 20  # Non-trivial journal entry
+        assert "Base" in j or "5.0%" in j
+
+    def test_hold_journal_varies_across_runs(self):
+        """Same input should produce different journals (randomized phrases)."""
+        pool = _make_pool(apy=5.0)
+        scored = {
+            "opp": _make_opp(apy=7.0),
+            "effective_apy": 7.0, "spread": 2.0,
+            "bridge_cost": 0.25, "bridge_pct": 0.25,
+            "break_even_days": 18, "net_payoff": -0.05,
+            "min_spread_met": True,
+        }
+        journals = {_build_hold_journal(pool, scored, 20) for _ in range(20)}
+        assert len(journals) > 1, "Journal should vary across runs"
+
+
+class TestFastBrainLimits:
+    """Test limit order integration."""
+
+    def test_limit_match(self):
+        opps = [
+            _make_opp(chain="Arbitrum", apy=12.0),
+            _make_opp(chain="Base", apy=8.0),
+        ]
+        limits = [{"chain": "Arbitrum", "min_apy": 10.0}]
+        match = _check_limits(opps, limits)
+        assert match is not None
+        assert match["chain"] == "Arbitrum"
+
+    def test_limit_no_match(self):
+        opps = [_make_opp(chain="Base", apy=8.0)]
+        limits = [{"chain": "Arbitrum", "min_apy": 10.0}]
+        match = _check_limits(opps, limits)
+        assert match is None

@@ -112,15 +112,21 @@ def calc_adaptive_slippage(pool: dict, position_usd: float) -> float:
 STRATEGY_PROFILES = {
     "conservative": {
         "min_tvl": 10_000_000, "min_apy": 2.0, "max_bridge_cost_pct": 1.0,
-        "min_confidence": 0.8, "trusted_only": True, "description": "Trusted protocols only, high TVL, low risk"
+        "min_confidence": 0.8, "trusted_only": True, "description": "Trusted protocols only, high TVL, low risk",
+        # FastBrain thresholds
+        "expected_hold_days": 14, "min_net_payoff_usd": 0.50, "min_spread_pct": 3.0, "gray_zone_width": 0.4,
     },
     "balanced": {
         "min_tvl": 500_000, "min_apy": 3.0, "max_bridge_cost_pct": 2.0,
-        "min_confidence": 0.6, "trusted_only": False, "description": "Default — moderate risk/reward"
+        "min_confidence": 0.6, "trusted_only": False, "description": "Default — moderate risk/reward",
+        # FastBrain thresholds
+        "expected_hold_days": 7, "min_net_payoff_usd": 0.20, "min_spread_pct": 1.5, "gray_zone_width": 0.4,
     },
     "aggressive": {
         "min_tvl": 100_000, "min_apy": 5.0, "max_bridge_cost_pct": 3.0,
-        "min_confidence": 0.4, "trusted_only": False, "description": "Higher APY chase, lower thresholds"
+        "min_confidence": 0.4, "trusted_only": False, "description": "Higher APY chase, lower thresholds",
+        # FastBrain thresholds
+        "expected_hold_days": 3, "min_net_payoff_usd": 0.05, "min_spread_pct": 0.5, "gray_zone_width": 0.4,
     },
 }
 
@@ -434,6 +440,15 @@ def withdraw(
     """
     from web3 import Web3
 
+    # If funds are deposited in a pool, warn the user
+    deposited = state.get("_deposited_pool")
+    if deposited:
+        protocol = deposited.get("protocol", "unknown")
+        raise ValueError(
+            f"Funds are deposited in {protocol} pool. "
+            f"Run /withdraw_pool first to exit, then withdraw."
+        )
+
     to_lower = to_address.strip().lower()
     if not OWNER_ADDRESSES:
         raise ValueError("No OWNER_ADDRESSES configured in .env. Set it before withdrawing.")
@@ -443,9 +458,8 @@ def withdraw(
             f"Approved: {', '.join(OWNER_ADDRESSES)}"
         )
 
-    position = state.get("position_usd", 0)
-    if amount_usd <= 0 or amount_usd > position:
-        raise ValueError(f"Invalid amount: ${amount_usd:.2f} (position: ${position:.2f})")
+    if amount_usd <= 0 and amount_usd != -1:
+        raise ValueError(f"Invalid amount: ${amount_usd:.2f} (use -1 for all)")
 
     chain_id = state["current_chain"]
     token = state.get("current_token", "USDC")
@@ -470,19 +484,27 @@ def withdraw(
     sender = Web3.to_checksum_address(wallet_addr)
     recipient = Web3.to_checksum_address(to_address)
 
-    # Verify on-chain balance
+    # Check actual on-chain balance (source of truth)
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(token_addr),
         abi=ERC20_TRANSFER_ABI,
     )
     on_chain_raw = contract.functions.balanceOf(sender).call()
     on_chain_usd = on_chain_raw / (10 ** decimals)
-    if on_chain_usd < amount_usd * 0.95:
-        raise ValueError(
-            f"On-chain balance ${on_chain_usd:.2f} < requested ${amount_usd:.2f}"
-        )
 
-    amount_raw = int(amount_usd * 10 ** decimals)
+    # Handle "withdraw all"
+    if amount_usd == -1:
+        amount_usd = on_chain_usd
+        amount_raw = on_chain_raw
+    else:
+        if on_chain_usd < amount_usd * 0.95:
+            raise ValueError(
+                f"On-chain balance ${on_chain_usd:.2f} < requested ${amount_usd:.2f}"
+            )
+        amount_raw = int(amount_usd * 10 ** decimals)
+
+    if amount_raw == 0:
+        raise ValueError(f"Nothing to withdraw — on-chain balance is $0")
 
     # Build transfer TX
     nonce = w3.eth.get_transaction_count(sender, "pending")

@@ -15,7 +15,10 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
-import brain
+if os.getenv("FAST_BRAIN", "true").lower() == "true":
+    import fast_brain as brain
+else:
+    import brain
 import lifi
 import protocols
 import wallet
