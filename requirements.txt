@@ -4,3 +4,4 @@ anthropic>=0.40
 python-dotenv>=1.0
 eth-account>=0.13
 web3>=7.0
+pytest>=8.0

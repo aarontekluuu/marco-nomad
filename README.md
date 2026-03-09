@@ -105,6 +105,20 @@ Marco isn't just a bot — he's a **character**. Every decision gets a journal e
 
 ---
 
+## Safety & Security
+
+Marco is built for real money, not just demos:
+
+- **TX destination validation** — every transaction is checked against known LI.FI diamond contract addresses before signing (prevents API compromise/MITM)
+- **Exact-amount approvals** — no `MAX_UINT256` approvals that could drain the wallet if a router is compromised
+- **EIP-1559 gas pricing** — on all transactions (including approvals) to reduce MEV exposure
+- **Confidence gating** — brain must output >60% confidence to trigger a migration
+- **Position safety guards** — minimum balance check, 4-hour migration cooldown to prevent fee thrashing
+- **Quote freshness** — re-fetches bridge quote right before execution (quotes go stale during AI thinking time)
+- **On-chain balance reconciliation** — compares tracked position with actual `balanceOf()` every cycle
+- **APY spike detection** — flags pools where current APY exceeds 5x the 30-day average
+- **Protocol trust scoring** — battle-tested protocols (Aave, Compound, Morpho, etc.) ranked higher
+
 ## Quick Start
 
 ```bash
@@ -119,26 +133,31 @@ pip install -r requirements.txt
 cp .env.template .env
 # Add your ANTHROPIC_API_KEY (required)
 # Add LIFI_API_KEY (optional, for higher rate limits)
-# Add TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (optional, for notifications)
 
-# Run once
+# Run one cycle (demo mode — no real transactions)
 python marco.py --once
 
 # Run continuous (hourly cycles)
 python marco.py
+
+# Run tests
+pytest tests/ -v
 ```
 
 ## Configuration
 
 | Variable | Default | What it does |
 |---|---|---|
+| `ANTHROPIC_API_KEY` | — | **Required.** Claude API key for brain |
+| `DEMO_MODE` | `true` | Simulate moves (no real transactions) |
 | `SCAN_CHAINS` | `8453,42161,10,137` | Chain IDs to scan (Base, Arb, OP, Polygon) |
 | `MIN_TVL_USD` | `500000` | Skip pools under this TVL |
 | `MIN_APY` | `3.0` | Minimum APY threshold |
 | `MAX_BRIDGE_COST_PCT` | `2.0` | Max bridge cost as % of position |
-| `POSITION_SIZE_USD` | `100` | Simulated position size |
-| `DEMO_MODE` | `true` | Simulate moves (no real txns) |
+| `MIN_CONFIDENCE` | `0.6` | Brain must be this confident to migrate |
+| `POSITION_SIZE_USD` | `100` | Position size in USD |
 | `LOOP_INTERVAL` | `3600` | Seconds between cycles |
+| `WALLET_PRIVATE_KEY` | — | LIVE mode only. Private key for signing |
 
 ---
 
@@ -156,14 +175,15 @@ python marco.py
 
 ```
 marco-nomad/
-├── marco.py           # Main agent loop (CLI entry point)
+├── marco.py           # Main agent loop — CLI entry point
+├── brain.py           # Claude decision engine + nomad personality
+├── lifi.py            # LI.FI API: quotes, routes, cost calc, TX execution
+├── yield_scanner.py   # DefiLlama scanning + protocol trust + spike detection
+├── wallet.py          # Position tracking, balance reconciliation, safety guards
+├── telegram_bot.py    # Telegram bot interface (optional)
 ├── main.py            # Alternative entry with Telegram bot integration
-├── brain.py           # Claude-powered decision engine + personality
-├── lifi.py            # LI.FI API: quotes, routes, cost calc, execution
-├── yield_scanner.py   # DefiLlama yield scanning + filtering
-├── wallet.py          # Position state tracking + migration history
-├── telegram_bot.py    # Telegram bot for /status, /scan, /migrate commands
-├── wallet_state.json  # Current position state
+├── tests/
+│   └── test_core.py   # 51 tests: bridge cost, yield filter, brain parsing, wallet
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```
