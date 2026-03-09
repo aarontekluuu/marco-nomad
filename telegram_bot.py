@@ -277,31 +277,51 @@ class MarcoBot:
             return
         import json
         from pathlib import Path
+        from wallet import load_state, get_strategy
+        from fast_brain import STRATEGY_EMOJI, STRATEGY_TITLE
+
+        state = load_state()
+        strategy = get_strategy(state)
+        emoji = STRATEGY_EMOJI.get(strategy, "🏜️")
+        title = STRATEGY_TITLE.get(strategy, "NOMAD")
+
         journal_file = Path(__file__).parent / "journal.json"
         entries = []
         if journal_file.exists():
             try:
                 raw = json.loads(journal_file.read_text())
                 if isinstance(raw, list):
-                    entries = [str(e) for e in raw[-3:]]  # Last 3 for conciseness
+                    entries = [str(e) for e in raw[-3:]]
             except (json.JSONDecodeError, OSError):
                 pass
         if not entries:
-            await update.message.reply_text("No journal entries yet. I'm still scouting.")
+            await update.message.reply_text(f"{emoji} No journal entries yet. The {title.lower()} is still scouting.")
             return
 
-        lines = ["📖 <b>Marco's Journal</b>\n"]
+        lines = [f"📖 <b>Marco's Journal</b> {emoji} {title}\n"]
         for entry in entries:
             text = entry
+            ts_str = ""
             if text.startswith("["):
                 bracket_end = text.find("]")
                 if bracket_end > 0:
-                    ts = text[1:bracket_end][:16]
+                    ts_str = text[1:bracket_end][:16]
                     text = text[bracket_end + 2:]
-                    lines.append(f"<i>{_escape(ts)}</i>")
+
+            # Extract decision type for visual marker
             if " [RISK:" in text:
                 text = text[:text.rfind(" [RISK:")]
-            lines.append(f"{_escape(text)}\n")
+
+            # Detect hold vs migrate for icon
+            text_lower = text.lower()
+            if any(w in text_lower for w in ["moving", "migrate", "packing", "relocat", "strike", "shipping", "hunt pays"]):
+                decision_icon = "🏃"
+            else:
+                decision_icon = "⏸️"
+
+            if ts_str:
+                lines.append(f"{decision_icon} <i>{_escape(ts_str)}</i>")
+            lines.append(f"<i>{_escape(text)}</i>\n")
 
         msg = _truncate("\n".join(lines))
         await update.message.reply_text(msg, parse_mode="HTML")
@@ -310,6 +330,7 @@ class MarcoBot:
         """Show deposit address and safety information."""
         if await self._reject_unauthorized(update):
             return
+        import wallet as wallet_mod
         from wallet import load_state, load_wallet, create_wallet, USDC
         from yield_scanner import CHAIN_MAP
         state = load_state()
@@ -333,12 +354,35 @@ class MarcoBot:
                     await update.message.reply_text(f"No wallet. Creation failed: {_escape(str(e))}")
                     return
 
+        # Check current on-chain balance
+        balance_str = ""
+        try:
+            from lifi import RPC_URLS
+            rpc = RPC_URLS.get(chain)
+            if rpc:
+                import asyncio
+                actual = await asyncio.to_thread(
+                    wallet_mod.check_onchain_balance, chain, addr, rpc, token=token,
+                )
+                if actual is not None and actual > 0:
+                    # Update state if balance changed
+                    if abs(actual - state.get("position_usd", 0)) > 0.01:
+                        state["position_usd"] = round(actual, 2)
+                        from wallet import save_state
+                        save_state(state)
+                    balance_str = f"\n💰 Current balance: <b>${actual:.2f}</b> {_escape(token)}"
+                elif actual == 0:
+                    balance_str = "\n💰 Current balance: $0.00"
+        except Exception:
+            pass
+
         lines = [
             "🏦 <b>Fund Marco</b>\n",
             f"Send <b>{_escape(token)}</b> on <b>{_escape(chain_name)}</b> to:\n",
-            f"<code>{_escape(addr)}</code>\n",
+            f"<code>{_escape(addr)}</code>",
+            f"{balance_str}\n",
             "⚠️ Only send stablecoins on the correct chain.",
-            "Start with a small test amount.",
+            "After sending, use /fund again to verify balance.",
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 

@@ -11,42 +11,149 @@ import random
 import tempfile
 from datetime import datetime
 
-# Marco-voice phrases — keyed by context for richer variety
-HOLD_PHRASES_CLOSE_SPREAD = [
-    "Close, but not close enough. Need more daylight between these yields.",
-    "Tempting, but the bridge tax wipes out the edge.",
-    "I've been burned chasing thin spreads before. Staying put.",
-    "Half a percent isn't worth the gas and the wait.",
-]
+# Strategy personas — each strategy has a distinct voice
+STRATEGY_EMOJI = {"conservative": "🏰", "balanced": "🏜️", "aggressive": "⚡"}
+STRATEGY_TITLE = {"conservative": "FORTRESS", "balanced": "NOMAD", "aggressive": "HUNTER"}
 
-HOLD_PHRASES_NO_OPPORTUNITY = [
-    "Nothing out there worth moving for. The nomad rests.",
-    "Dry season across all four chains. Patience.",
-    "Scanned everything — yields are flat. Holding is the play.",
-    "Market's quiet. I'll check again next cycle.",
-]
-
-HOLD_PHRASES_COMFORTABLE = [
-    "Why leave a good thing? This APY is solid.",
-    "Sitting pretty. No reason to uproot.",
-    "Happy where I am. The yield is consistent.",
-    "Comfortable. The 30-day average confirms this isn't a fluke.",
-]
-
-HOLD_PHRASES_SPIKE_REJECTED = [
-    "Spotted a spike — {best_apy:.0f}% on {best_chain}. But the 30-day tells the real story: {mean30d:.1f}%. Pass.",
-    "Nice try, {best_chain}. That APY spike won't last. I've seen this movie before.",
-    "Flashy numbers on {best_chain} but the 30-day average says it's smoke.",
-]
-
-MIGRATE_PHRASES = [
-    "Time to move. {spread:.1f}% spread — the math is clear.",
-    "Packing up. Break-even in {break_even:.0f} days, then it's pure profit.",
-    "The spread is too good to sit on. {from_chain} had its run.",
-    "LI.FI routing me to {to_chain}. ${bridge_cost:.2f} toll for a {spread:.1f}% upgrade? Done.",
-    "{to_chain} {project} caught my eye — {target_apy:.1f}% and the TVL backs it up.",
-    "Moving the whole bag. {from_chain} yields are compressing while {to_chain} heats up.",
-]
+# --- CONSERVATIVE: The Fortress Builder ---
+# Patient, risk-averse, detail-obsessed, speaks in terms of defense and certainty
+PHRASES = {
+    "conservative": {
+        "hold_close_spread": [
+            "Half a percent doesn't breach these walls. The fortress holds.",
+            "Not enough edge to justify the risk. I build on certainty, not hope.",
+            "Tempting bait. But the 30-day tells me this spread won't last.",
+            "The cost of being wrong outweighs the gain. Walls stay up.",
+        ],
+        "hold_no_opportunity": [
+            "Fortress holds. Nothing out there meets the bar.",
+            "Scanned every protocol. Nothing passes the fortress test.",
+            "Quiet day. The moat is deep and the yield is real. Patience.",
+            "No movement worth the risk. The fortress was built for days like this.",
+        ],
+        "hold_comfortable": [
+            "This yield is battle-tested. The 30-day confirms it. Staying.",
+            "Deep TVL, audited protocol, steady APY. This is what the fortress was built for.",
+            "Solid ground. No reason to chase noise when the foundation holds.",
+            "The fortress earns while it sleeps. No complaints.",
+        ],
+        "hold_spike": [
+            "{best_chain} spiking {best_apy:.0f}%? The 30-day says {mean30d:.1f}%. I don't chase mirages.",
+            "Spike on {best_chain} — classic trap. The fortress waits for proven yield.",
+            "Flashy numbers don't impress stone walls. {best_chain}'s spike will fade.",
+        ],
+        "migrate": [
+            "The fortress relocates. {spread:.1f}% spread on proven ground — this is calculated, not reckless.",
+            "New fortification on {to_chain}. {project} has the TVL depth I trust.",
+            "Moving with conviction. Break-even in {break_even:.0f} days, then the fortress grows.",
+            "The spread is fortress-grade: {spread:.1f}% on audited rails. Executing.",
+        ],
+        "opener_high": [
+            "The fortress earns well on {chain}. {apy:.1f}% on solid ground.",
+            "Walls are thick, yield is flowing. {chain} at {apy:.1f}%.",
+        ],
+        "opener_mid": [
+            "Steady returns on {chain}. {apy:.1f}% — not flashy, but proven.",
+            "The fortress ticks along at {apy:.1f}% on {chain}. Scanned {n} pools.",
+        ],
+        "opener_low": [
+            "Yields thinning on {chain}. {apy:.1f}% is below fortress standards.",
+            "{chain} at {apy:.1f}%. The fortress watches, waits for real opportunity.",
+        ],
+    },
+    # --- BALANCED: The Wandering Nomad ---
+    # Pragmatic, curious, dry humor, speaks in travel metaphors
+    "balanced": {
+        "hold_close_spread": [
+            "Close, but the bridge tax eats the edge. Not worth the detour.",
+            "Tempting trail, but the math says stay. I've been burned chasing thin spreads.",
+            "Half a percent? I've walked longer roads for less. But not today.",
+            "The spread whispers, but the bridge cost shouts. Staying put.",
+        ],
+        "hold_no_opportunity": [
+            "Dry season across all four chains. The nomad rests.",
+            "Scanned the whole map — nothing worth packing up for.",
+            "Market's flat. Sometimes the best move is no move.",
+            "Quiet out there. I'll check the horizon next cycle.",
+        ],
+        "hold_comfortable": [
+            "Comfortable camp. Why uproot for a marginal edge?",
+            "This spot earns. The 30-day confirms it's not a fluke.",
+            "Happy where I am. The yield is real and the trail was long.",
+            "Settled in. Good yield, decent TVL, no drama.",
+        ],
+        "hold_spike": [
+            "{best_chain} spiking {best_apy:.0f}%? The 30-day tells the real story: {mean30d:.1f}%. I've seen this movie.",
+            "Nice mirage, {best_chain}. That spike will evaporate by tomorrow.",
+            "Flashy numbers on {best_chain} but the 30-day average says smoke.",
+        ],
+        "migrate": [
+            "Time to wander. {spread:.1f}% spread — the math clears.",
+            "Packing up camp. Break-even in {break_even:.0f} days, then it's pure trail profit.",
+            "{from_chain} had its moment. {to_chain} is calling louder now.",
+            "LI.FI routing me through. ${bridge_cost:.2f} toll for a {spread:.1f}% upgrade.",
+            "{to_chain} {project} caught my eye — {target_apy:.1f}% with real TVL behind it.",
+        ],
+        "opener_high": [
+            "Good camp on {chain}. {project} still pumping {apy:.1f}%.",
+            "{chain} at {apy:.1f}% — hard to complain about this spot.",
+        ],
+        "opener_mid": [
+            "Parked on {chain}, {apy:.1f}% ticking away. Scanned {n} pools.",
+            "Another cycle on {chain}. {apy:.1f}% isn't flashy but it's honest.",
+        ],
+        "opener_low": [
+            "{chain} yields drying up at {apy:.1f}%. Eyes on the horizon.",
+            "Restless on {chain}. {apy:.1f}% barely justifies the camp.",
+        ],
+    },
+    # --- AGGRESSIVE: The Yield Hunter ---
+    # Hungry, confident, impatient, speaks in hunting/combat metaphors
+    "aggressive": {
+        "hold_close_spread": [
+            "Too small. I'm hunting bigger game than {spread:.1f}%.",
+            "That spread's a snack, not a meal. Need more alpha.",
+            "Barely worth the gas. I want blood-pumping spreads, not scraps.",
+            "The hunter waits for the kill shot. This ain't it.",
+        ],
+        "hold_no_opportunity": [
+            "Nothing moving. Even the hunter has to wait sometimes.",
+            "Dead market. Every chain is flat. Reloading for next cycle.",
+            "The prey went underground. Yields flat everywhere. Patience, predator.",
+            "Scanned everything — all quiet. The hunt continues.",
+        ],
+        "hold_comfortable": [
+            "Locked onto good yield. But always watching for the next big one.",
+            "Eating well at {apy:.1f}%. But the hunter never sleeps.",
+            "This is a good kill. Feasting while I scout the next target.",
+            "Strong position. But the moment something bigger appears, I'm gone.",
+        ],
+        "hold_spike": [
+            "{best_chain} pumping {best_apy:.0f}%? Smells like bait. 30-day says {mean30d:.1f}%. Pass.",
+            "Spike on {best_chain}? I've seen faster traps. The 30-day is my truth.",
+            "Even the hunter knows when the prey is poisoned. {best_chain} spike is fake.",
+        ],
+        "migrate": [
+            "That spread is fire. {spread:.1f}% — moving NOW.",
+            "The hunt pays off. {to_chain} {project} at {target_apy:.1f}%. Locked in.",
+            "Break-even in {break_even:.0f} days? That's a blink. Shipping it.",
+            "{from_chain} is dead weight. {to_chain} is where the alpha lives now.",
+            "No hesitation. ${bridge_cost:.2f} bridge for {spread:.1f}% edge? The hunter strikes.",
+        ],
+        "opener_high": [
+            "Feasting on {chain}. {apy:.1f}% — this is what the hunt is for.",
+            "The kill is good. {chain} at {apy:.1f}%. Watching for the next.",
+        ],
+        "opener_mid": [
+            "Decent yield on {chain} at {apy:.1f}%. But the hunter wants more.",
+            "{chain} holding {apy:.1f}%. Acceptable. Not exceptional. Scanning {n} pools.",
+        ],
+        "opener_low": [
+            "{chain} at {apy:.1f}%? Starving. Need to find the next kill.",
+            "Hungry on {chain}. {apy:.1f}% is beneath the hunter. Scanning hard.",
+        ],
+    },
+}
 
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH", os.path.expanduser("~/.local/bin/claude"))
 
@@ -163,35 +270,25 @@ def _build_hold_journal(
     current_pool: dict | None,
     best_scored: dict | None,
     num_scanned: int,
+    strategy: str = "balanced",
 ) -> str:
-    """Context-aware hold journal — varies by why we're holding."""
+    """Strategy-aware hold journal — persona changes with risk profile."""
     chain = current_pool.get("chain", "somewhere") if current_pool else "somewhere"
     apy = current_pool.get("apy", 0) if current_pool else 0
     project = current_pool.get("project", "") if current_pool else ""
+    p = PHRASES.get(strategy, PHRASES["balanced"])
 
     # Pick opening based on current APY level
+    fmt = {"chain": chain, "apy": apy, "project": project, "n": num_scanned}
     if apy >= 15:
-        openers = [
-            f"Day's looking good on {chain}. {project} still pumping {apy:.1f}%.",
-            f"{chain} at {apy:.1f}% — hard to complain about that.",
-            f"Still earning {apy:.1f}% on {chain}. The nomad stays.",
-        ]
+        opener = random.choice(p["opener_high"]).format(**fmt)
     elif apy >= 8:
-        openers = [
-            f"Parked on {chain}, {apy:.1f}% ticking away quietly.",
-            f"{chain} holding steady at {apy:.1f}%. Scanned {num_scanned} pools.",
-            f"Another cycle on {chain}. {apy:.1f}% isn't flashy but it's real.",
-        ]
+        opener = random.choice(p["opener_mid"]).format(**fmt)
     else:
-        openers = [
-            f"{chain} yields looking thin at {apy:.1f}%. Scanned {num_scanned} pools looking for better.",
-            f"Restless on {chain}. {apy:.1f}% barely beats inflation.",
-            f"Sitting on {chain} at {apy:.1f}%. Hungry for more but the math has to work.",
-        ]
-    opener = random.choice(openers)
+        opener = random.choice(p["opener_low"]).format(**fmt)
 
     if not best_scored or best_scored["spread"] <= 0:
-        phrase = random.choice(HOLD_PHRASES_NO_OPPORTUNITY)
+        phrase = random.choice(p["hold_no_opportunity"])
         return f"{opener} {phrase}"
 
     best = best_scored["opp"]
@@ -200,28 +297,32 @@ def _build_hold_journal(
 
     # Pick closing phrase based on WHY we're holding
     if best.get("_apy_spike"):
-        phrase = random.choice(HOLD_PHRASES_SPIKE_REJECTED).format(
+        phrase = random.choice(p["hold_spike"]).format(
             best_apy=best_scored["effective_apy"],
             best_chain=best_chain,
             mean30d=best.get("apyMean30d", 0),
         )
     elif best_scored["spread"] < 2.0:
-        phrase = random.choice(HOLD_PHRASES_CLOSE_SPREAD)
+        phrase = random.choice(p["hold_close_spread"]).format(
+            spread=best_scored["spread"],
+        )
     elif apy >= 10:
-        phrase = random.choice(HOLD_PHRASES_COMFORTABLE)
+        phrase = random.choice(p["hold_comfortable"]).format(apy=apy)
     else:
-        phrase = random.choice(HOLD_PHRASES_CLOSE_SPREAD + HOLD_PHRASES_NO_OPPORTUNITY)
+        phrase = random.choice(p["hold_close_spread"] + p["hold_no_opportunity"]).format(
+            spread=best_scored.get("spread", 0),
+        )
 
     # Trend commentary
     trend_note = ""
     trend = best.get("_trend")
     if trend and trend.get("data_points", 0) >= 3:
         if trend.get("slope", 0) < -0.5:
-            trend_note = " APY falling fast over the week though — risky."
+            trend_note = " APY falling fast over the week — risky."
         elif trend.get("is_rising"):
-            trend_note = " APY trending up too — momentum is real."
+            trend_note = " Momentum is real — APY trending up."
         elif trend.get("volatility", 0) > 25:
-            trend_note = " Volatile yield though — could vanish tomorrow."
+            trend_note = " Volatile yield — could vanish tomorrow."
 
     return (
         f"{opener} Best I found: {best_chain} {best_project} at "
@@ -233,57 +334,48 @@ def _build_hold_journal(
 def _build_migrate_journal(
     current_pool: dict | None,
     best_scored: dict,
+    strategy: str = "balanced",
 ) -> str:
-    """Context-aware migrate journal."""
+    """Strategy-aware migrate journal."""
     from_chain = current_pool.get("chain", "?") if current_pool else "?"
     current_apy = current_pool.get("apy", 0) if current_pool else 0
-    from_project = current_pool.get("project", "") if current_pool else ""
     best = best_scored["opp"]
     to_chain = best.get("chain", "?")
     project = best.get("project", "?")
     bridge_tool = best.get("bridge_tool", "LI.FI")
+    p = PHRASES.get(strategy, PHRASES["balanced"])
+
+    fmt = {
+        "spread": best_scored["spread"],
+        "break_even": best_scored["break_even_days"],
+        "from_chain": from_chain,
+        "to_chain": to_chain,
+        "project": project,
+        "target_apy": best_scored["effective_apy"],
+        "bridge_cost": best_scored["bridge_cost"],
+    }
 
     # Context-aware opening
     if current_apy < 5:
-        openers = [
-            f"{from_chain} dried up — {current_apy:.1f}% isn't cutting it.",
-            f"Can't sit on {current_apy:.1f}% while {to_chain} is offering {best_scored['effective_apy']:.1f}%.",
-            f"{from_chain} {from_project} fading at {current_apy:.1f}%. Time to pack up.",
-        ]
+        opener = f"{from_chain} at {current_apy:.1f}% — can't stay. {to_chain} offering {best_scored['effective_apy']:.1f}%."
     elif best_scored["spread"] > 10:
-        openers = [
-            f"Massive opportunity just opened up. {best_scored['spread']:.0f}% spread — haven't seen that in a while.",
-            f"{to_chain} is on fire. {best_scored['effective_apy']:.1f}% on {project} while I'm earning {current_apy:.1f}% here.",
-            f"The yield gap between {from_chain} and {to_chain} just got too wide to ignore.",
-        ]
+        opener = f"Massive {best_scored['spread']:.0f}% spread opened. {to_chain} {project} is the play."
     else:
-        openers = [
-            f"Solid spread appeared: {from_chain} at {current_apy:.1f}% vs {to_chain} at {best_scored['effective_apy']:.1f}%.",
-            f"Markets shifted. {to_chain} {project} pulling ahead at {best_scored['effective_apy']:.1f}%.",
-            f"Opportunity on {to_chain} — {project} offering a clean {best_scored['spread']:.1f}% edge.",
-        ]
+        opener = f"{from_chain} at {current_apy:.1f}% vs {to_chain} at {best_scored['effective_apy']:.1f}%. Spread is clean."
 
-    phrase = random.choice(MIGRATE_PHRASES).format(
-        spread=best_scored["spread"],
-        break_even=best_scored["break_even_days"],
-        from_chain=from_chain,
-        to_chain=to_chain,
-        project=project,
-        target_apy=best_scored["effective_apy"],
-        bridge_cost=best_scored["bridge_cost"],
-    )
-    # Trend commentary for migrate
+    phrase = random.choice(p["migrate"]).format(**fmt)
+
+    # Trend commentary
     trend_note = ""
     trend = best.get("_trend")
     if trend and trend.get("data_points", 0) >= 3:
         if trend.get("is_rising"):
-            trend_note = f" Yield's been climbing for {trend['data_points']} snapshots — this isn't a fluke."
+            trend_note = f" Yield climbing for {trend['data_points']} snapshots — confirmed."
         elif trend.get("is_stable"):
-            trend_note = " Stable yield history backs this up."
+            trend_note = " Stable history backs this up."
 
     return (
-        f"{random.choice(openers)} "
-        f"Bridge via LI.FI ({bridge_tool}): ${best_scored['bridge_cost']:.2f} "
+        f"{opener} Bridge via LI.FI ({bridge_tool}): ${best_scored['bridge_cost']:.2f} "
         f"({best_scored['bridge_pct']:.1f}%). {phrase}{trend_note}"
     )
 
@@ -331,9 +423,11 @@ def _get_strategy_params() -> dict:
         profile_name = get_strategy(state)
         profile = STRATEGY_PROFILES.get(profile_name, STRATEGY_PROFILES["balanced"])
     except Exception:
+        profile_name = "balanced"
         profile = {}
 
     return {
+        "strategy": profile_name,
         "expected_hold_days": profile.get("expected_hold_days", 7),
         "min_net_payoff_usd": profile.get("min_net_payoff_usd", 0.20),
         "min_spread_pct": profile.get("min_spread_pct", 1.5),
@@ -350,6 +444,7 @@ async def decide(
 ) -> dict:
     """Drop-in replacement for brain.decide(). Returns {"journal": str, "decision": dict}."""
     params = _get_strategy_params()
+    strategy = params["strategy"]
     expected_hold_days = params["expected_hold_days"]
     min_net_payoff = params["min_net_payoff_usd"]
     min_spread = params["min_spread_pct"]
@@ -395,7 +490,7 @@ async def decide(
     # Decision logic
     if not best or best["net_payoff"] <= 0 or not best["min_spread_met"]:
         # Clear HOLD
-        journal = _build_hold_journal(current_pool, best, len(opportunities))
+        journal = _build_hold_journal(current_pool, best, len(opportunities), strategy)
         return {
             "journal": journal,
             "decision": {
@@ -422,7 +517,7 @@ async def decide(
             best["spread"],
             trend=best_opp.get("_trend"),
         )
-        journal = _build_migrate_journal(current_pool, best)
+        journal = _build_migrate_journal(current_pool, best, strategy)
         move = {
             "from_chain": current_pool.get("chain", "?") if current_pool else "?",
             "to_chain": best_opp.get("chain", "?"),
@@ -458,7 +553,7 @@ async def decide(
             return result
         except Exception:
             # Claude unavailable — conservative hold
-            journal = _build_hold_journal(current_pool, best, len(opportunities))
+            journal = _build_hold_journal(current_pool, best, len(opportunities), strategy)
             return {
                 "journal": journal + " (gray zone — Claude offline, defaulting to hold)",
                 "decision": {
@@ -470,7 +565,7 @@ async def decide(
             }
     else:
         # Below gray zone — clear HOLD
-        journal = _build_hold_journal(current_pool, best, len(opportunities))
+        journal = _build_hold_journal(current_pool, best, len(opportunities), strategy)
         return {
             "journal": journal,
             "decision": {
