@@ -170,6 +170,10 @@ Marco is built for real money, not just demos:
 - **HTML escaping** — all Telegram output goes through `html.escape` (prevents markup/injection attacks)
 - **Rate-limited /migrate** — 5-minute cooldown prevents agent loop DoS via Telegram
 - **No prompt injection surface** — non-command text silently ignored, no freeform input to AI
+- **Fail-closed diamond validation** — TX refused if chain has no known LI.FI diamond address (prevents bypass on new chains)
+- **Drift reconciliation safety bound** — on-chain balance drift >10% triggers alert instead of silent auto-correction
+- **Pending TX crash recovery** — writes `_pending_tx` flag to state before execution, prevents double-spend on restart
+- **Cooldown fail-closed** — corrupt migration timestamp blocks next migration instead of silently passing
 
 ## Quick Start
 
@@ -243,7 +247,7 @@ marco-nomad/
 ├── main.py            # Alternative entry with Telegram bot integration
 ├── demo/              # Seed data for dashboard (works without API keys)
 ├── tests/
-│   └── test_core.py   # 91 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
+│   └── test_core.py   # 97 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```

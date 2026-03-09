@@ -452,13 +452,15 @@ class TestCanMigrate:
         ok, _ = can_migrate(state, cost_usd=0.25)
         assert ok is True
 
-    def test_malformed_timestamp_ignored(self):
+    def test_malformed_timestamp_blocks_migration(self):
+        """Fail-closed: corrupt timestamp should block migration, not silently pass."""
         state = {
             "position_usd": 100.0,
             "migrations": [{"timestamp": "not-a-date"}],
         }
-        ok, _ = can_migrate(state, cost_usd=0.50)
-        assert ok is True  # bad timestamp is silently skipped
+        ok, reason = can_migrate(state, cost_usd=0.50)
+        assert ok is False  # Fail-closed on invalid timestamp
+        assert "invalid" in reason.lower()
 
     def test_missing_position_usd(self):
         state = {"migrations": []}
@@ -506,17 +508,24 @@ class TestWalletSafety:
         assert valid is True
 
     def test_address_mismatch_detection(self):
+        """check_wallet_address_match should fail if web3 can't derive address (fail-closed)."""
         from wallet import check_wallet_address_match
         state = {"address": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
-        # This key is format-valid but will derive a different address
-        # The function should detect mismatch if web3 is available
-        # If web3 is not available, it returns True with a warning
         ok, msg = check_wallet_address_match(state, "0" * 64)
-        # Either catches mismatch OR warns about missing web3
-        assert ok is True or "MISMATCH" in msg
+        # Should fail: either MISMATCH (if web3 installed) or cannot verify (if not)
+        # Both cases are fail-closed in LIVE mode
+        try:
+            from eth_account import Account
+            # web3 installed: should detect mismatch
+            assert ok is False
+            assert "MISMATCH" in msg
+        except ImportError:
+            # web3 not installed: should fail-closed
+            assert ok is False
+            assert "cannot verify" in msg.lower()
 
     def test_auto_set_address_when_empty(self):
-        """If no address configured, check_wallet_address_match should set it."""
+        """If no address configured, behavior depends on web3 availability."""
         import tempfile
         from wallet import check_wallet_address_match, STATE_FILE
         state = {"address": "", "current_chain": 8453, "migrations": []}
@@ -525,8 +534,13 @@ class TestWalletSafety:
             import wallet
             wallet.STATE_FILE = Path(tempfile.mktemp(suffix=".json"))
             ok, msg = check_wallet_address_match(state, "0" * 64)
-            # Should succeed — either sets address or warns about web3
-            assert ok is True
+            try:
+                from eth_account import Account
+                # web3 installed: should set address and succeed
+                assert ok is True
+            except ImportError:
+                # web3 not installed: should fail-closed
+                assert ok is False
         finally:
             if wallet.STATE_FILE.exists():
                 wallet.STATE_FILE.unlink()
@@ -888,3 +902,106 @@ class TestTelegramSecurity:
             if match:
                 body = match.group()[:500]  # First 500 chars of method
                 assert "_reject_unauthorized" in body, f"{method} missing auth check"
+
+
+class TestSecurityHardening:
+    """Tests for security hardening round 3: fail-closed validations."""
+
+    def test_diamond_validation_fail_closed(self):
+        """lifi.py should fail-closed when diamond address is unknown for a chain."""
+        from pathlib import Path
+        lifi_code = (Path(__file__).parent.parent / "lifi.py").read_text()
+        # Must contain fail-closed check: "if not known_diamond" before the address comparison
+        assert "if not known_diamond:" in lifi_code
+        assert "Refusing to sign" in lifi_code
+
+    def test_drift_reconciliation_safety_bound(self):
+        """Large balance drifts (>10%) should not be auto-corrected."""
+        import wallet as w
+        import tempfile, json, os
+        state = {
+            "address": "0x1234",
+            "current_chain": 8453,
+            "current_token": "USDC",
+            "position_usd": 100.0,
+            "migrations": [],
+        }
+        # Simulate a 50% drift — should NOT auto-correct
+        original = w.STATE_FILE
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+            json.dump(state, tmp)
+            tmp.close()
+            w.STATE_FILE = Path(tmp.name)
+
+            # Mock check_onchain_balance to return 50.0 (50% drift from 100.0)
+            from unittest.mock import patch
+            with patch.object(w, "check_onchain_balance", return_value=50.0):
+                drift = w.reconcile_balance(state, "http://fake-rpc")
+
+            assert drift == -50.0
+            # Position should NOT have been updated (drift too large)
+            assert state["position_usd"] == 100.0
+            # Should have set a drift alert
+            assert "_drift_alert" in state
+            assert state["_drift_alert"]["drift_pct"] == 50.0
+        finally:
+            w.STATE_FILE = original
+            os.unlink(tmp.name)
+
+    def test_drift_small_auto_corrects(self):
+        """Small balance drifts (<10%) should auto-correct normally."""
+        import wallet as w
+        import tempfile, json, os
+        state = {
+            "address": "0x1234",
+            "current_chain": 8453,
+            "current_token": "USDC",
+            "position_usd": 100.0,
+            "migrations": [],
+        }
+        original = w.STATE_FILE
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+            json.dump(state, tmp)
+            tmp.close()
+            w.STATE_FILE = Path(tmp.name)
+
+            from unittest.mock import patch
+            with patch.object(w, "check_onchain_balance", return_value=99.50):
+                drift = w.reconcile_balance(state, "http://fake-rpc")
+
+            assert drift == -0.5
+            # Small drift — should have been auto-corrected
+            assert state["position_usd"] == 99.50
+        finally:
+            w.STATE_FILE = original
+            os.unlink(tmp.name)
+
+    def test_cooldown_fail_closed_on_bad_timestamp(self):
+        """Invalid migration timestamp should block migration (fail-closed)."""
+        import wallet as w
+        state = {
+            "position_usd": 100.0,
+            "migrations": [{"timestamp": "not-a-date", "cost_usd": 0.1}],
+        }
+        allowed, reason = w.can_migrate(state, 0.5)
+        assert not allowed
+        assert "invalid" in reason.lower()
+
+    def test_web3_required_for_address_verification(self):
+        """Address verification should fail if web3 can't derive address."""
+        import wallet as w
+        # validate_private_key returns empty address when web3 unavailable
+        from unittest.mock import patch
+        with patch.object(w, "validate_private_key", return_value=(True, "", "web3 not installed")):
+            ok, msg = w.check_wallet_address_match({"address": "0xabc"}, "deadbeef" * 8)
+        assert not ok
+        assert "web3" in msg.lower() or "cannot verify" in msg.lower()
+
+    def test_pending_tx_flag_in_source(self):
+        """marco.py should write _pending_tx before execution and clear after."""
+        from pathlib import Path
+        marco_code = (Path(__file__).parent.parent / "marco.py").read_text()
+        assert '"_pending_tx"' in marco_code or "'_pending_tx'" in marco_code
+        assert 'pop("_pending_tx"' in marco_code

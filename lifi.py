@@ -181,7 +181,12 @@ async def execute_quote(
     raw_chain_id = tx.get("chainId")
     chain_id = _parse_int(raw_chain_id) if raw_chain_id is not None else await _call(lambda: w3.eth.chain_id)
     known_diamond = LIFI_DIAMOND.get(chain_id)
-    if known_diamond and tx_to.lower() != known_diamond.lower():
+    if not known_diamond:
+        raise ValueError(
+            f"No known LI.FI diamond address for chain {chain_id}. "
+            f"Refusing to sign — add chain to LIFI_DIAMOND before executing."
+        )
+    if tx_to.lower() != known_diamond.lower():
         raise ValueError(
             f"TX destination {tx_to} does not match known LI.FI diamond "
             f"{known_diamond} on chain {chain_id}. Refusing to sign — possible API compromise."
@@ -194,7 +199,7 @@ async def execute_quote(
         # SECURITY: Validate approval address matches known diamond
         # A compromised API could return an attacker's address as spender
         approval_checksum = Web3.to_checksum_address(approval_addr)
-        if known_diamond and approval_checksum.lower() != known_diamond.lower():
+        if approval_checksum.lower() != known_diamond.lower():
             raise ValueError(
                 f"Approval address {approval_checksum} does not match known LI.FI diamond "
                 f"{known_diamond} on chain {chain_id}. Refusing to approve — possible API compromise."

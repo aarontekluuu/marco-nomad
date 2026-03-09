@@ -100,7 +100,8 @@ def check_wallet_address_match(state: dict, private_key: str) -> tuple[bool, str
     if not valid:
         return False, f"Invalid private key: {err}"
     if not derived_addr:
-        return True, "Cannot verify (web3 not installed)"
+        # In LIVE mode, web3 is required to verify address — fail-closed
+        return False, "Cannot verify address: web3/eth_account not installed. Required for LIVE mode."
     configured_addr = state.get("address", "")
     if not configured_addr:
         # No address configured — auto-set from key
@@ -162,7 +163,8 @@ def can_migrate(state: dict, cost_usd: float) -> tuple[bool, str]:
             if hours_since < MIN_MIGRATION_INTERVAL_HOURS:
                 return False, f"Cooldown: {hours_since:.1f}h since last migration (min {MIN_MIGRATION_INTERVAL_HOURS}h)"
         except (ValueError, TypeError):
-            pass
+            # Fail-closed: if timestamp is corrupt, enforce cooldown to prevent rapid migrations
+            return False, "Cooldown: last migration timestamp is invalid — blocking until next cycle"
 
     return True, "ok"
 
@@ -272,9 +274,28 @@ def reconcile_balance(state: dict, rpc_url: str) -> float | None:
     tracked = state.get("position_usd", 0)
     drift = actual - tracked
     if abs(drift) > 0.01:  # More than 1 cent drift
+        # Safety: refuse auto-correction for large drifts (>10% of position)
+        # This prevents silent state corruption from failed bridges or double-spends
+        drift_pct = abs(drift) / tracked * 100 if tracked > 0 else 100
+        if drift_pct > 10:
+            import logging
+            logging.getLogger(__name__).critical(
+                f"LARGE DRIFT: on-chain ${actual:.2f} vs tracked ${tracked:.2f} "
+                f"(drift: ${drift:+.2f}, {drift_pct:.1f}%). Refusing auto-correction."
+            )
+            state["_drift_alert"] = {
+                "timestamp": datetime.now().isoformat(),
+                "on_chain": round(actual, 2),
+                "tracked": round(tracked, 2),
+                "drift_usd": round(drift, 4),
+                "drift_pct": round(drift_pct, 2),
+            }
+            save_state(state)
+            return drift  # Return drift but don't update position
         state["position_usd"] = round(actual, 2)
         state["_last_reconcile"] = datetime.now().isoformat()
         state["_last_drift_usd"] = round(drift, 4)
+        state.pop("_drift_alert", None)  # Clear any previous alert
         save_state(state)
     return drift
 

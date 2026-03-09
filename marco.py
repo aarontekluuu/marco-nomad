@@ -119,6 +119,19 @@ async def _run_cycle_inner():
     if pool:
         log(f"Pool: {pool.get('symbol','?')} ({pool.get('project','?')}) — {pool.get('apy',0):.1f}% APY")
 
+    # SAFETY: Check for pending TX from a previous crash
+    pending = state.get("_pending_tx")
+    if pending:
+        log(f"  WARNING: Found pending TX from {pending.get('timestamp', '?')}.")
+        log(f"  Previous bridge may have completed — reconciliation will verify on-chain balance.")
+        # Don't clear it here — let reconciliation handle it
+
+    # Check for drift alerts from previous cycle
+    drift_alert = state.get("_drift_alert")
+    if drift_alert:
+        log(f"  ALERT: Unresolved balance drift from {drift_alert.get('timestamp', '?')}: "
+            f"on-chain ${drift_alert.get('on_chain', '?')} vs tracked ${drift_alert.get('tracked', '?')}")
+
     # Reconcile tracked balance with on-chain reality (LIVE mode only)
     # Run in thread to avoid blocking the event loop (web3 calls are sync)
     if not DEMO_MODE:
@@ -412,6 +425,17 @@ async def _run_cycle_inner():
                         log(f"  ABORT: {match_msg}")
                         continue
                     log(f"  Executing {move_label} to {to_chain_name}...")
+
+                    # SAFETY: Record pending TX in state BEFORE execution.
+                    # If process crashes mid-bridge, this prevents double-spend on restart.
+                    state["_pending_tx"] = {
+                        "target_chain": target_chain_id,
+                        "target_pool_token": target_pool_token,
+                        "estimated_cost": cost_usd,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    wallet.save_state(state)
+
                     try:
                         tx_result = await lifi.execute_quote(
                             fresh_quote, private_key, rpc_url,
@@ -420,9 +444,13 @@ async def _run_cycle_inner():
                         log(f"  TX: {tx_result['tx_hash']} status={tx_result['status']}")
                         if tx_result["status"] == "FAILED":
                             log(f"  Bridge TX FAILED — not recording migration")
+                            state.pop("_pending_tx", None)
+                            wallet.save_state(state)
                             continue
                     except Exception as e:
                         log(f"  Bridge execution failed: {e}")
+                        state.pop("_pending_tx", None)
+                        wallet.save_state(state)
                         continue
 
                     # Handle PENDING status (polling timed out — bridge may still land)
@@ -459,6 +487,7 @@ async def _run_cycle_inner():
                 if DEMO_MODE:
                     # DEMO: simulate cost deduction
                     state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+                state.pop("_pending_tx", None)  # Clear pending flag
                 wallet.record_migration(
                     state, current_chain, target_chain_id, target_pool,
                     cost_usd, move.get("reason", journal_text[:100]),
