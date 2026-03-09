@@ -133,9 +133,10 @@ class MarcoBot:
         """Unified status: position + pool + P&L + recent moves. Replaces /portfolio and /pnl."""
         if await self._reject_unauthorized(update):
             return
-        from wallet import load_state, calc_pnl
+        from wallet import load_state, calc_pnl, get_strategy
         from yield_scanner import CHAIN_MAP
         state = load_state()
+        strategy = get_strategy(state)
 
         chain = state.get("current_chain", "?")
         chain_name = CHAIN_MAP.get(chain, f"Chain {chain}")
@@ -191,9 +192,10 @@ class MarcoBot:
                 )
 
         # Agent state
+        lines.append(f"\n🎯 Strategy: <b>{_escape(strategy)}</b>")
         if self.agent:
             paused = self.agent.get("paused", False)
-            lines.append(f"\n{'⏸️ Paused' if paused else '▶️ Running'}")
+            lines.append(f"{'⏸️ Paused' if paused else '▶️ Running'}")
 
         await update.message.reply_text(
             _truncate("\n".join(lines)), parse_mode="HTML"
@@ -208,20 +210,32 @@ class MarcoBot:
         try:
             import httpx
             from yield_scanner import scan_yields
-            from wallet import load_state
+            from wallet import load_state, get_strategy, STRATEGY_PROFILES
 
             state = load_state()
             current_pool = state.get("current_pool")
             current_apy = current_pool.get("apy", 0) if current_pool else 0
 
+            # Apply active strategy filters
+            profile_name = get_strategy(state)
+            profile = STRATEGY_PROFILES.get(profile_name, STRATEGY_PROFILES["balanced"])
+            min_tvl = profile.get("min_tvl", 500_000)
+            min_apy = profile.get("min_apy", 3.0)
+            trusted_only = profile.get("trusted_only", False)
+
             async with httpx.AsyncClient() as client:
-                pools = await scan_yields(client, chains=[8453, 42161, 10, 137])
+                pools = await scan_yields(client, chains=[8453, 42161, 10, 137],
+                                          min_tvl=min_tvl, min_apy=min_apy)
+
+            # Filter to trusted-only if strategy requires it
+            if trusted_only:
+                pools = [p for p in pools if p.get("_trusted")]
 
             if not pools:
                 await update.message.reply_text("No pools found matching criteria.")
                 return
 
-            lines = ["📡 <b>Top Yields</b>"]
+            lines = [f"📡 <b>Top Yields</b> ({profile_name})"]
             if current_pool:
                 lines.append(
                     f"You: {_escape(current_pool.get('chain', '?'))} "
@@ -601,6 +615,10 @@ class MarcoBot:
 
         if target_chain == current_chain:
             await update.message.reply_text("Already on that chain.")
+            return
+
+        if position <= 0:
+            await update.message.reply_text("No balance to quote. Fund Marco first with /fund.")
             return
 
         from_token_addr = USDC.get(current_chain)

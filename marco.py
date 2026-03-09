@@ -49,7 +49,11 @@ MAX_JOURNAL_ENTRIES = 100
 
 def load_journal() -> list[str]:
     if JOURNAL_FILE.exists():
-        return json.loads(JOURNAL_FILE.read_text())
+        try:
+            return json.loads(JOURNAL_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            log("WARNING: journal.json corrupted, starting fresh")
+            return []
     return []
 
 
@@ -454,6 +458,9 @@ async def _run_cycle_inner():
                         log(f"  Withdrawing from {deposited_pool['protocol']} pool before migration...")
                         try:
                             rpc_url = lifi.RPC_URLS.get(current_chain)
+                            if not rpc_url:
+                                log(f"  No RPC URL for chain {current_chain} — skipping pool withdraw")
+                                raise ValueError(f"No RPC for chain {current_chain}")
                             from web3 import Web3
                             w3 = Web3(Web3.HTTPProvider(rpc_url))
                             wallet_info = wallet.load_wallet()
@@ -518,6 +525,7 @@ async def _run_cycle_inner():
                         continue
 
                     amount_wei = str(int(move_usd * 10**current_token_decimals))
+                    fresh_cost = None
                     try:
                         fresh_quote = await lifi.get_quote(
                             client, current_chain, exec_to_chain,
@@ -695,8 +703,8 @@ async def _run_cycle_inner():
                                     token=dest_token,
                                 )
                                 if actual is not None:
-                                    expected_min = fresh_cost["to_amount_min"]
-                                    if actual < expected_min * 0.95:
+                                    expected_min = fresh_cost.get("to_amount_min", 0) if fresh_cost else 0
+                                    if expected_min and actual < expected_min * 0.95:
                                         log(f"  WARNING: received ${actual:.2f} < expected min ${expected_min:.2f}")
                                     else:
                                         log(f"  Verified: ${actual:.2f} received on {to_chain_name}")
@@ -724,6 +732,9 @@ async def _run_cycle_inner():
                     log(f"  Depositing into {target_project} pool on {to_chain_name}...")
                     try:
                         dest_rpc = lifi.RPC_URLS.get(target_chain_id)
+                        if not dest_rpc:
+                            log(f"  No RPC URL for chain {target_chain_id} — skipping pool deposit")
+                            break
                         from web3 import Web3
                         w3 = Web3(Web3.HTTPProvider(dest_rpc))
                         wallet_info = wallet.load_wallet()
