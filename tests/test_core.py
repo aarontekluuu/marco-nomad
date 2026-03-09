@@ -296,13 +296,16 @@ class TestFilterPools:
         assert len(result) == 1
         assert result[0]["chain"] == "Base"
 
-    def test_sorts_by_base_apy(self):
+    def test_sorts_by_mean30d_with_trust_boost(self):
         pools = [
             _pool(apy=10.0, apy_base=3.0),
             _pool(apy=8.0, apy_base=7.0),
         ]
+        # Add apyMean30d to control sort order
+        pools[0]["apyMean30d"] = 4.0
+        pools[1]["apyMean30d"] = 6.0
         result = filter_pools(pools)
-        assert result[0]["apyBase"] == 7.0  # higher base APY first
+        assert result[0]["apyMean30d"] == 6.0  # higher 30d avg first
 
     def test_max_results(self):
         pools = [_pool(apy=5.0 + i) for i in range(30)]

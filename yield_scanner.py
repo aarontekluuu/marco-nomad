@@ -56,6 +56,20 @@ async def fetch_pools(client: httpx.AsyncClient) -> list[dict]:
     return _pool_cache
 
 
+# Trusted protocols — large, audited, battle-tested DeFi protocols
+# Pools from unlisted protocols are deprioritized (not excluded) for hackathon flexibility
+TRUSTED_PROTOCOLS = {
+    "aave-v3", "aave-v2", "compound-v3", "compound-v2", "morpho", "morpho-blue",
+    "spark", "maker", "sky", "curve-dex", "convex-finance", "yearn-finance",
+    "lido", "rocket-pool", "frax-ether", "benqi-lending", "radiant-v2",
+    "silo-v2", "moonwell", "seamless-protocol", "fluid", "euler",
+    "venus", "stargate", "across", "hop-protocol", "synapse", "merkl",
+}
+
+# Max ratio of current APY to 30-day average before flagging as suspicious spike
+MAX_APY_SPIKE_RATIO = 5.0
+
+
 def filter_pools(
     pools: list[dict],
     chains: list[int] | None = None,
@@ -87,10 +101,29 @@ def filter_pools(
             continue
         if no_il_risk and p.get("ilRisk") == "yes":
             continue
+
+        # Detect suspicious APY spikes: current >> 30-day average
+        mean30d = p.get("apyMean30d") or 0
+        if mean30d > 0 and apy / mean30d > MAX_APY_SPIKE_RATIO:
+            p["_apy_spike"] = True  # Flag for brain context, don't hard-exclude
+
+        # Mark protocol trust level
+        project = (p.get("project") or "").lower()
+        p["_trusted"] = project in TRUSTED_PROTOCOLS
+
         filtered.append(p)
 
-    # Sort by base APY (sustainable yield) rather than total APY
-    filtered.sort(key=lambda x: -(x.get("apyBase") or x.get("apy") or 0))
+    # Sort by apyMean30d (sustainable yield) — more reliable than spot APY or apyBase
+    # Trusted protocols get a 1.5x boost in sort score
+    def _sort_key(x):
+        base = x.get("apyMean30d") or x.get("apyBase") or x.get("apy") or 0
+        if x.get("_trusted"):
+            base *= 1.5
+        if x.get("_apy_spike"):
+            base *= 0.5  # Penalize spikes in ranking
+        return -base
+
+    filtered.sort(key=_sort_key)
     return filtered[:max_results]
 
 

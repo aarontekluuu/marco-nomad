@@ -92,6 +92,7 @@ def record_migration(state: dict, from_chain: int, to_chain: int, pool: dict, co
     })
     state["current_chain"] = to_chain
     state["current_pool"] = {
+        "pool_id": pool.get("pool"),  # DefiLlama unique pool UUID
         "symbol": pool.get("symbol"),
         "project": pool.get("project"),
         "chain": pool.get("chain"),

@@ -118,6 +118,13 @@ async def decide(
         )
         if opp.get("bridge_cost_usd"):
             line += f" | Bridge: ${opp['bridge_cost_usd']:.2f} ({opp.get('bridge_cost_pct', 0):.1f}%)"
+        flags = []
+        if opp.get("_apy_spike"):
+            flags.append("⚠ APY SPIKE")
+        if opp.get("_trusted"):
+            flags.append("✓ trusted")
+        if flags:
+            line += f" | {' '.join(flags)}"
         context_parts.append(line)
 
     if recent_journal:
