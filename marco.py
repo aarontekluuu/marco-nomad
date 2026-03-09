@@ -86,6 +86,17 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+def _banner():
+    """Print startup banner for demo/video recording."""
+    print()
+    print("  ╔══════════════════════════════════════════╗")
+    print("  ║        🏜️  Marco the Nomad  🏜️          ║")
+    print("  ║   Autonomous Cross-Chain Yield Agent     ║")
+    print("  ║   Powered by LI.FI + Claude + DefiLlama ║")
+    print("  ╚══════════════════════════════════════════╝")
+    print()
+
+
 _cycle_lock = asyncio.Lock()
 
 
@@ -100,8 +111,13 @@ async def run_cycle():
 
 async def _run_cycle_inner():
     """Inner cycle logic (always called under _cycle_lock)."""
+    print()
+    log("─── Cycle Start ───────────────────────────────")
     state = wallet.load_state()
-    log(f"Current state:\n{wallet.format_state(state)}")
+    log(f"Position: ${state['position_usd']:.2f} {state.get('current_token', 'USDC')} on {CHAIN_MAP.get(state['current_chain'], '?')}")
+    pool = state.get("current_pool")
+    if pool:
+        log(f"Pool: {pool.get('symbol','?')} ({pool.get('project','?')}) — {pool.get('apy',0):.1f}% APY")
 
     # Reconcile tracked balance with on-chain reality (LIVE mode only)
     # Run in thread to avoid blocking the event loop (web3 calls are sync)
@@ -264,7 +280,7 @@ async def _run_cycle_inner():
         portfolio = {chain_name: {current_token.lower(): position_usd, "native": 0}}
 
         # 6. Ask Marco's brain
-        log("Marco is thinking...")
+        log("─── Marco is thinking... ─────────────────────")
         journal_entries = load_journal()
         result = await brain.decide(
             portfolio, candidates, journal_entries[-3:],
@@ -277,10 +293,12 @@ async def _run_cycle_inner():
 
         confidence = decision.get("confidence", 0.5)
         risk_notes = decision.get("risk_notes", "")
-        log(f"Decision: {decision.get('action', 'hold').upper()} (confidence: {confidence:.0%})")
+        action = decision.get("action", "hold").upper()
+        action_icon = "🏃" if action == "MIGRATE" else "⏸️"
+        log(f"─── Decision: {action_icon} {action} (confidence: {confidence:.0%}) ──")
         if risk_notes:
-            log(f"Risk notes: {risk_notes}")
-        log(f"Journal: {journal_text[:200]}...")
+            log(f"Risk: {risk_notes}")
+        log(f"Journal: {journal_text[:200]}")
 
         # 7. Record journal entry (include risk notes if present)
         entry = f"[{datetime.now().isoformat()}] {journal_text}"
@@ -458,9 +476,13 @@ async def _run_cycle_inner():
 
 
 async def main():
-    mode = "DEMO (simulated)" if DEMO_MODE else "LIVE (real execution)"
-    log(f"Marco the Nomad waking up... Mode: {mode}")
-    log(f"Chains: {SCAN_CHAINS} | Min TVL: ${MIN_TVL:,.0f} | Min APY: {MIN_APY}%")
+    _banner()
+    mode = "DEMO (simulated)" if DEMO_MODE else "LIVE (real transactions)"
+    chain_names = [CHAIN_MAP.get(c, str(c)) for c in SCAN_CHAINS]
+    log(f"Mode: {mode}")
+    log(f"Scanning: {', '.join(chain_names)}")
+    log(f"Filters: TVL ≥ ${MIN_TVL:,.0f} | APY ≥ {MIN_APY}% | Bridge cap: {MAX_BRIDGE_COST_PCT}%")
+    log(f"Slippage: {SLIPPAGE*100:.1f}% | Confidence gate: {MIN_CONFIDENCE:.0%} | Cycle: {LOOP_INTERVAL}s")
 
     # SECURITY: Validate wallet configuration at startup (LIVE mode only)
     if not DEMO_MODE:
@@ -490,7 +512,8 @@ async def main():
             log(f"Cycle error: {e}")
             import traceback
             traceback.print_exc()
-        log(f"Sleeping {LOOP_INTERVAL}s...")
+        next_min = LOOP_INTERVAL // 60
+        log(f"─── Sleeping {next_min}m until next cycle ────────────")
         await asyncio.sleep(LOOP_INTERVAL)
 
 

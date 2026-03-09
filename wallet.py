@@ -281,10 +281,15 @@ def reconcile_balance(state: dict, rpc_url: str) -> float | None:
 
 def format_state(state: dict) -> str:
     """Format current wallet state for display."""
+    from yield_scanner import CHAIN_MAP
     pool = state.get("current_pool")
-    pool_str = f"{pool['symbol']} on {pool['chain']} ({pool['project']}, {pool['apy']:.2f}%)" if pool else "None"
+    chain_name = CHAIN_MAP.get(state["current_chain"], f"Chain {state['current_chain']}")
+    token = state.get("current_token", "USDC")
+    pool_str = f"{pool['symbol']} on {pool['project']} — {pool['apy']:.1f}% APY" if pool else "None"
+    migrations = state.get("migrations", [])
+    total_cost = sum(m.get("cost_usd", 0) for m in migrations)
     return (
-        f"Chain: {state['current_chain']} | Position: ${state['position_usd']:.2f}\n"
-        f"Pool: {pool_str}\n"
-        f"Migrations: {len(state.get('migrations', []))}"
+        f"${state['position_usd']:.2f} {token} on {chain_name} | "
+        f"Pool: {pool_str} | "
+        f"Migrations: {len(migrations)} (${total_cost:.2f} total cost)"
     )
