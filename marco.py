@@ -34,6 +34,7 @@ LIFI_API_KEY = os.getenv("LIFI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.6"))
 
 JOURNAL_FILE = Path(__file__).parent / "journal.json"
 MAX_JOURNAL_ENTRIES = 100
@@ -156,15 +157,24 @@ async def run_cycle():
         journal_text = result["journal"]
         decision = result["decision"]
 
-        log(f"Decision: {decision.get('action', 'hold').upper()}")
+        confidence = decision.get("confidence", 0.5)
+        risk_notes = decision.get("risk_notes", "")
+        log(f"Decision: {decision.get('action', 'hold').upper()} (confidence: {confidence:.0%})")
+        if risk_notes:
+            log(f"Risk notes: {risk_notes}")
         log(f"Journal: {journal_text[:200]}...")
 
-        # 5. Record journal entry
-        journal_entries.append(f"[{datetime.now().isoformat()}] {journal_text}")
+        # 5. Record journal entry (include risk notes if present)
+        entry = f"[{datetime.now().isoformat()}] {journal_text}"
+        if risk_notes:
+            entry += f" [RISK: {risk_notes}]"
+        journal_entries.append(entry)
         save_journal(journal_entries)
 
-        # 6. Execute moves if migrating
-        if decision.get("action") == "migrate" and decision.get("moves"):
+        # 6. Execute moves if migrating (gate on confidence)
+        if decision.get("action") == "migrate" and decision.get("moves") and confidence < MIN_CONFIDENCE:
+            log(f"  BLOCKED: confidence {confidence:.0%} < {MIN_CONFIDENCE:.0%} threshold — holding instead")
+        elif decision.get("action") == "migrate" and decision.get("moves"):
             for move in decision["moves"]:
                 to_chain_name = move.get("to_chain", "")
                 target_chain_id = CHAIN_MAP_REVERSE.get(to_chain_name)
@@ -194,6 +204,12 @@ async def run_cycle():
 
                 cost_usd = quote_data["cost"]["total_cost_usd"] if quote_data else 0
 
+                # Respect brain's amount_pct (partial moves instead of always full position)
+                move_pct = min(max(move.get("amount_pct", 1.0), 0.1), 1.0)
+                move_usd = position_usd * move_pct
+                if move_pct < 1.0:
+                    log(f"  Partial move: {move_pct:.0%} of position (${move_usd:.2f})")
+
                 # Safety check: min balance and migration cooldown
                 allowed, block_reason = wallet.can_migrate(state, cost_usd)
                 if not allowed:
@@ -208,7 +224,7 @@ async def run_cycle():
                     log(f"  Re-fetching fresh quote for {to_chain_name}...")
                     from_token = wallet.USDC.get(current_chain)
                     to_token = wallet.USDC.get(target_chain_id)
-                    amount_wei = str(int(position_usd * 10**wallet.USDC_DECIMALS))
+                    amount_wei = str(int(move_usd * 10**wallet.USDC_DECIMALS))
                     try:
                         fresh_quote = await lifi.get_quote(
                             client, current_chain, target_chain_id,
@@ -216,7 +232,7 @@ async def run_cycle():
                             api_key=LIFI_API_KEY,
                         )
                         fresh_cost = lifi.calc_bridge_cost(fresh_quote)
-                        fresh_cost_pct = (fresh_cost["total_cost_usd"] / position_usd * 100) if position_usd > 0 else 0
+                        fresh_cost_pct = (fresh_cost["total_cost_usd"] / move_usd * 100) if move_usd > 0 else 0
                         if fresh_cost_pct > MAX_BRIDGE_COST_PCT:
                             log(f"  BLOCKED: fresh quote cost {fresh_cost_pct:.2f}% exceeds limit")
                             continue
