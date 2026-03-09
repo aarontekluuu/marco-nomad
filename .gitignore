@@ -5,5 +5,5 @@ __pycache__/
 .wallet.json
 .pytest_cache/
 *.tmp
-wallet_state.json
-journal.json
+/wallet_state.json
+/journal.json
