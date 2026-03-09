@@ -61,34 +61,6 @@ async def get_quote(
     return resp.json()
 
 
-async def get_routes(
-    client: httpx.AsyncClient,
-    from_chain: int,
-    to_chain: int,
-    from_token: str,
-    to_token: str,
-    from_amount: str,
-    from_address: str,
-    slippage: float = 0.03,
-    api_key: str | None = None,
-) -> list[dict]:
-    """Get multiple route options via advanced/routes."""
-    body = {
-        "fromChainId": from_chain,
-        "toChainId": to_chain,
-        "fromTokenAddress": from_token,
-        "toTokenAddress": to_token,
-        "fromAmount": from_amount,
-        "fromAddress": from_address,
-        "options": {"slippage": slippage, "order": "RECOMMENDED"},
-    }
-    resp = await client.post(
-        f"{BASE}/advanced/routes", headers=_headers(api_key), json=body, timeout=30
-    )
-    resp.raise_for_status()
-    return resp.json().get("routes", [])
-
-
 async def check_status(
     client: httpx.AsyncClient,
     tx_hash: str,
@@ -218,13 +190,18 @@ async def execute_quote(
             quote = await refetch_fn()
 
     w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+    # Helper: run sync web3 calls in thread to avoid blocking the event loop
+    async def _call(fn, *args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
     tx = quote["transactionRequest"]
     sender = Web3.to_checksum_address(tx["from"])
     from_amount = int(quote["action"]["fromAmount"])
 
     # SECURITY: Validate TX destination is a known LI.FI contract
     tx_to = Web3.to_checksum_address(tx["to"])
-    chain_id = tx.get("chainId", w3.eth.chain_id)
+    chain_id = tx.get("chainId", await _call(lambda: w3.eth.chain_id))
     known_diamond = LIFI_DIAMOND.get(chain_id)
     if known_diamond and tx_to.lower() != known_diamond.lower():
         raise ValueError(
@@ -240,17 +217,19 @@ async def execute_quote(
             address=Web3.to_checksum_address(from_token),
             abi=ERC20_ABI,
         )
-        current_allowance = erc20.functions.allowance(
-            sender, Web3.to_checksum_address(approval_addr)
-        ).call()
+        current_allowance = await _call(
+            erc20.functions.allowance(
+                sender, Web3.to_checksum_address(approval_addr)
+            ).call
+        )
 
         if current_allowance < from_amount:
             # Approve exact amount — MAX_UINT256 is a security risk if router is compromised
-            nonce = w3.eth.get_transaction_count(sender, "pending")
+            nonce = await _call(w3.eth.get_transaction_count, sender, "pending")
             approve_build = {"from": sender, "nonce": nonce}
             # Use EIP-1559 for approval TX too (same MEV protection as bridge TX)
             try:
-                latest = w3.eth.get_block("latest")
+                latest = await _call(w3.eth.get_block, "latest")
                 if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
                     approve_build["maxFeePerGas"] = latest.baseFeePerGas * 2
                     approve_build["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
@@ -261,9 +240,8 @@ async def execute_quote(
                 from_amount,
             ).build_transaction(approve_build)
             signed = w3.eth.account.sign_transaction(approve_tx, private_key)
-            w3.eth.send_raw_transaction(signed.raw_transaction)
-            # Run sync web3 call in thread to avoid blocking the event loop
-            approve_receipt = await asyncio.to_thread(
+            await _call(w3.eth.send_raw_transaction, signed.raw_transaction)
+            approve_receipt = await _call(
                 w3.eth.wait_for_transaction_receipt, signed.hash, timeout=120
             )
             if approve_receipt.status != 1:
@@ -273,7 +251,7 @@ async def execute_quote(
                 )
 
     # 2. Build TX with EIP-1559 gas if available, fallback to legacy
-    nonce = w3.eth.get_transaction_count(sender, "pending")
+    nonce = await _call(w3.eth.get_transaction_count, sender, "pending")
     send_tx = {
         "from": sender,
         "to": Web3.to_checksum_address(tx["to"]),
@@ -281,12 +259,12 @@ async def execute_quote(
         "value": _parse_int(tx.get("value", 0)),
         "gas": _parse_int(tx.get("gasLimit", tx.get("gas", 500000))),
         "nonce": nonce,
-        "chainId": tx.get("chainId", w3.eth.chain_id),
+        "chainId": tx.get("chainId", await _call(lambda: w3.eth.chain_id)),
     }
 
     # Prefer EIP-1559 (reduces MEV exposure via base fee mechanism)
     try:
-        latest = w3.eth.get_block("latest")
+        latest = await _call(w3.eth.get_block, "latest")
         if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
             send_tx["maxFeePerGas"] = latest.baseFeePerGas * 2
             send_tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
@@ -299,7 +277,7 @@ async def execute_quote(
     # 3. Simulate TX before signing (catches reverts without spending gas)
     sim_tx = {k: v for k, v in send_tx.items() if k not in ("nonce", "chainId")}
     try:
-        w3.eth.call(sim_tx, "latest")
+        await _call(w3.eth.call, sim_tx, "latest")
     except Exception as e:
         raise RuntimeError(
             f"TX simulation reverted — would fail on-chain and waste gas. Error: {e}"
@@ -307,13 +285,11 @@ async def execute_quote(
 
     # 4. Sign and send
     signed = w3.eth.account.sign_transaction(send_tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    tx_hash = await _call(w3.eth.send_raw_transaction, signed.raw_transaction)
     tx_hash_hex = tx_hash.hex()
 
-    # 5. Wait for on-chain confirmation (in thread — web3 HTTPProvider is sync)
-    receipt = await asyncio.to_thread(
-        w3.eth.wait_for_transaction_receipt, tx_hash, timeout=300
-    )
+    # 5. Wait for on-chain confirmation
+    receipt = await _call(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=300)
     if receipt.status != 1:
         return {"tx_hash": tx_hash_hex, "status": "FAILED", "receipt": dict(receipt)}
 

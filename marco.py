@@ -50,7 +50,21 @@ def save_journal(entries: list[str]):
     # Cap journal size — keep most recent entries
     if len(entries) > MAX_JOURNAL_ENTRIES:
         entries = entries[-MAX_JOURNAL_ENTRIES:]
-    JOURNAL_FILE.write_text(json.dumps(entries, indent=2))
+    # Atomic write: tmp file + rename (matches wallet.save_state pattern)
+    import tempfile
+    data = json.dumps(entries, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=JOURNAL_FILE.parent, suffix=".tmp")
+    try:
+        os.write(fd, data.encode())
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_path, JOURNAL_FILE)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 async def send_telegram(client: httpx.AsyncClient, message: str):
@@ -268,13 +282,12 @@ async def run_cycle():
                         log(f"  Bridge execution failed: {e}")
                         continue
 
-                # Record migration and deduct bridge cost from position
+                # Deduct bridge cost BEFORE recording (single atomic save)
+                state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
                 wallet.record_migration(
                     state, current_chain, target_chain_id, target_pool,
                     cost_usd, move.get("reason", journal_text[:100]),
                 )
-                state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
-                wallet.save_state(state)
                 log(f"  Migration recorded: -> {to_chain_name} (cost: ${cost_usd:.2f}, position now: ${state['position_usd']:.2f})")
 
         # 7. Notify
