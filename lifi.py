@@ -13,27 +13,6 @@ def _headers(api_key: str | None = None) -> dict:
     return h
 
 
-async def get_chains(client: httpx.AsyncClient, api_key: str | None = None) -> list[dict]:
-    """List all supported chains."""
-    resp = await client.get(f"{BASE}/chains", headers=_headers(api_key), timeout=15)
-    resp.raise_for_status()
-    return resp.json()["chains"]
-
-
-async def get_tokens(
-    client: httpx.AsyncClient,
-    chain_ids: list[int] | None = None,
-    api_key: str | None = None,
-) -> dict:
-    """List supported tokens, optionally filtered by chain."""
-    params = {}
-    if chain_ids:
-        params["chains"] = ",".join(str(c) for c in chain_ids)
-    resp = await client.get(f"{BASE}/tokens", headers=_headers(api_key), params=params, timeout=15)
-    resp.raise_for_status()
-    return resp.json()["tokens"]
-
-
 async def get_quote(
     client: httpx.AsyncClient,
     from_chain: int,
@@ -145,9 +124,6 @@ ERC20_ABI = [
     },
 ]
 
-MAX_UINT256 = 2**256 - 1  # Kept for reference but not used in approvals (exact amount preferred)
-
-
 def _parse_int(val) -> int:
     """Parse an int from hex string (0x...) or decimal string."""
     if isinstance(val, int):
@@ -224,7 +200,7 @@ async def execute_quote(
         )
 
         if current_allowance < from_amount:
-            # Approve exact amount — MAX_UINT256 is a security risk if router is compromised
+            # Approve exact amount — infinite approval is a security risk if router is compromised
             nonce = await _call(w3.eth.get_transaction_count, sender, "pending")
             approve_build = {"from": sender, "nonce": nonce}
             # Use EIP-1559 for approval TX too (same MEV protection as bridge TX)
@@ -353,15 +329,3 @@ RPC_URLS = {
 }
 
 
-def format_quote(quote: dict) -> str:
-    """Format a quote for display."""
-    cost = calc_bridge_cost(quote)
-    action = quote.get("action", {})
-    from_sym = action.get("fromToken", {}).get("symbol", "?")
-    to_sym = action.get("toToken", {}).get("symbol", "?")
-    return (
-        f"{from_sym} -> {to_sym} via {cost['bridge']}\n"
-        f"  Send: {cost['from_amount']:.4f} | Receive: {cost['to_amount']:.4f} (min: {cost['to_amount_min']:.4f})\n"
-        f"  Cost: ${cost['total_cost_usd']:.2f} (fees: ${cost['fee_usd']:.2f} + gas: ${cost['gas_usd']:.2f})\n"
-        f"  Duration: ~{cost['duration_seconds']}s"
-    )

@@ -92,10 +92,11 @@ async def run_cycle():
     log(f"Current state:\n{wallet.format_state(state)}")
 
     # Reconcile tracked balance with on-chain reality (LIVE mode only)
+    # Run in thread to avoid blocking the event loop (web3 calls are sync)
     if not DEMO_MODE:
         rpc_url = lifi.RPC_URLS.get(state["current_chain"])
         if rpc_url:
-            drift = wallet.reconcile_balance(state, rpc_url)
+            drift = await asyncio.to_thread(wallet.reconcile_balance, state, rpc_url)
             if drift is not None and abs(drift) > 0.01:
                 log(f"Balance reconciled: drift was ${drift:+.2f} (now ${state['position_usd']:.2f})")
 

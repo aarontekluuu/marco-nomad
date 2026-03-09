@@ -163,8 +163,9 @@ async def decide(
     # Extract JSON block — regex is robust to missing closing fences or extra whitespace
     json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if not json_match:
-        # Fallback: try to find a raw JSON object (no fences)
-        json_match = re.search(r'(\{[^{}]*"action"\s*:.*?\})', text, re.DOTALL)
+        # Fallback: find the last top-level JSON object containing "action"
+        # Greedy match from { to final } handles nested braces (moves array etc.)
+        json_match = re.search(r'(\{.*"action"\s*:.*\})', text, re.DOTALL)
 
     if json_match:
         try:

@@ -9,6 +9,7 @@ from pathlib import Path
 STATE_FILE = Path(__file__).parent / "wallet_state.json"
 MIN_POSITION_USD = 5.0  # Never migrate if position would drop below this
 MIN_MIGRATION_INTERVAL_HOURS = 4  # Cooldown between migrations to prevent thrashing
+MAX_MIGRATIONS = 200  # Cap migration history to prevent wallet_state.json bloat
 
 # Well-known USDC addresses per chain (must match yield_scanner.CHAIN_MAP)
 USDC = {
@@ -79,7 +80,7 @@ def can_migrate(state: dict, cost_usd: float) -> tuple[bool, str]:
 
 
 def record_migration(state: dict, from_chain: int, to_chain: int, pool: dict, cost_usd: float, reason: str):
-    """Record a migration decision."""
+    """Record a migration decision. Caps history at MAX_MIGRATIONS."""
     state["migrations"].append({
         "timestamp": datetime.now().isoformat(),
         "from_chain": from_chain,
@@ -90,6 +91,9 @@ def record_migration(state: dict, from_chain: int, to_chain: int, pool: dict, co
         "cost_usd": cost_usd,
         "reason": reason,
     })
+    # Cap migration history
+    if len(state["migrations"]) > MAX_MIGRATIONS:
+        state["migrations"] = state["migrations"][-MAX_MIGRATIONS:]
     state["current_chain"] = to_chain
     state["current_pool"] = {
         "pool_id": pool.get("pool"),  # DefiLlama unique pool UUID

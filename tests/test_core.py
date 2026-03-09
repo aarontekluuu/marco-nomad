@@ -27,7 +27,7 @@ def _extract_decision(text: str) -> dict:
     default = {"action": "hold", "moves": [], "confidence": 0.5, "risk_notes": ""}
     json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if not json_match:
-        json_match = re.search(r'(\{[^{}]*"action"\s*:.*?\})', text, re.DOTALL)
+        json_match = re.search(r'(\{.*"action"\s*:.*\})', text, re.DOTALL)
     if json_match:
         try:
             return json.loads(json_match.group(1))
@@ -56,12 +56,12 @@ class TestBrainJsonExtraction:
         result = _extract_decision(text)
         assert result["action"] == "rebalance"
 
-    def test_unfenced_json_with_nested_braces_fails(self):
-        """Known limitation: unfenced JSON with nested objects hits [^{}]* barrier."""
+    def test_unfenced_json_with_nested_braces(self):
+        """Greedy fallback regex handles nested braces in moves array."""
         text = 'No fences. {"action": "migrate", "moves": [{"from_chain": "base"}]}'
         result = _extract_decision(text)
-        # Falls back to default because regex can't handle nested braces
-        assert result["action"] == "hold"
+        assert result["action"] == "migrate"
+        assert len(result["moves"]) == 1
 
     def test_malformed_json_returns_default(self):
         text = '```json\n{"action": "migrate", broken json\n```'
@@ -376,7 +376,7 @@ class TestFilterPools:
 # wallet.py — can_migrate, save_state, state round-trip
 # ---------------------------------------------------------------------------
 
-from wallet import can_migrate, save_state, load_state, MIN_POSITION_USD, MIN_MIGRATION_INTERVAL_HOURS
+from wallet import can_migrate, save_state, load_state, record_migration, MIN_POSITION_USD, MIN_MIGRATION_INTERVAL_HOURS, MAX_MIGRATIONS
 
 
 class TestCanMigrate:
@@ -500,6 +500,32 @@ class TestSaveStateAndRoundTrip:
             save_state({"x": 1})
         tmp_files = list(tmp_path.glob("*.tmp"))
         assert len(tmp_files) == 0
+
+
+class TestMigrationsCap:
+    """Ensure migrations list doesn't grow unbounded."""
+
+    def test_cap_at_max_migrations(self, tmp_path):
+        state_file = tmp_path / "wallet_state.json"
+        state = {"position_usd": 100.0, "migrations": [], "current_chain": 8453}
+        # Add MAX_MIGRATIONS + 10 entries
+        for i in range(MAX_MIGRATIONS + 10):
+            state["migrations"].append({"timestamp": f"2026-01-01T{i:05d}", "from_chain": 8453, "to_chain": 42161})
+        pool = {"symbol": "USDC", "project": "aave-v3", "chain": "Base", "apy": 5.0, "pool": "abc"}
+        with patch("wallet.STATE_FILE", state_file):
+            record_migration(state, 42161, 8453, pool, 0.25, "test")
+        assert len(state["migrations"]) == MAX_MIGRATIONS
+
+    def test_keeps_most_recent_migrations(self, tmp_path):
+        state_file = tmp_path / "wallet_state.json"
+        state = {"position_usd": 100.0, "migrations": [], "current_chain": 8453}
+        for i in range(MAX_MIGRATIONS + 5):
+            state["migrations"].append({"timestamp": f"entry-{i}", "from_chain": 8453, "to_chain": 42161})
+        pool = {"symbol": "USDC", "project": "aave-v3", "chain": "Base", "apy": 5.0, "pool": "abc"}
+        with patch("wallet.STATE_FILE", state_file):
+            record_migration(state, 42161, 8453, pool, 0.25, "test")
+        # Most recent entry should be the one we just added
+        assert state["migrations"][-1]["reason"] == "test"
 
 
 # ---------------------------------------------------------------------------
