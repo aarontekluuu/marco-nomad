@@ -336,6 +336,133 @@ BALANCE_OF_ABI = [
     },
 ]
 
+ERC20_TRANSFER_ABI = [
+    {
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
+]
+
+# Pre-approved withdrawal addresses (set in .env as comma-separated)
+OWNER_ADDRESSES = [
+    a.strip().lower()
+    for a in os.getenv("OWNER_ADDRESSES", "").split(",")
+    if a.strip()
+]
+
+
+def withdraw(
+    state: dict, to_address: str, amount_usd: float, private_key: str,
+) -> dict:
+    """Withdraw stablecoins to a pre-approved owner address.
+
+    SAFETY:
+    - Only sends to addresses in OWNER_ADDRESSES allowlist
+    - Verifies on-chain balance before sending
+    - Maximum single withdrawal capped at position size
+    - Returns {"tx_hash": str, "amount": float, "to": str} or raises
+
+    Must be called from a thread (sync web3 calls).
+    """
+    from web3 import Web3
+
+    to_lower = to_address.strip().lower()
+    if not OWNER_ADDRESSES:
+        raise ValueError("No OWNER_ADDRESSES configured in .env. Set it before withdrawing.")
+    if to_lower not in OWNER_ADDRESSES:
+        raise ValueError(
+            f"Address {to_address} is not in OWNER_ADDRESSES allowlist. "
+            f"Approved: {', '.join(OWNER_ADDRESSES)}"
+        )
+
+    position = state.get("position_usd", 0)
+    if amount_usd <= 0 or amount_usd > position:
+        raise ValueError(f"Invalid amount: ${amount_usd:.2f} (position: ${position:.2f})")
+
+    chain_id = state["current_chain"]
+    token = state.get("current_token", "USDC")
+    stable_info = STABLECOINS.get((chain_id, token))
+    if stable_info:
+        token_addr = stable_info["address"]
+        decimals = stable_info["decimals"]
+    else:
+        token_addr = USDC.get(chain_id)
+        decimals = USDC_DECIMALS
+
+    if not token_addr:
+        raise ValueError(f"No token address for {token} on chain {chain_id}")
+
+    from lifi import RPC_URLS
+    rpc_url = RPC_URLS.get(chain_id)
+    if not rpc_url:
+        raise ValueError(f"No RPC URL for chain {chain_id}")
+
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    wallet_addr = state.get("address", "")
+    sender = Web3.to_checksum_address(wallet_addr)
+    recipient = Web3.to_checksum_address(to_address)
+
+    # Verify on-chain balance
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token_addr),
+        abi=ERC20_TRANSFER_ABI,
+    )
+    on_chain_raw = contract.functions.balanceOf(sender).call()
+    on_chain_usd = on_chain_raw / (10 ** decimals)
+    if on_chain_usd < amount_usd * 0.95:
+        raise ValueError(
+            f"On-chain balance ${on_chain_usd:.2f} < requested ${amount_usd:.2f}"
+        )
+
+    amount_raw = int(amount_usd * 10 ** decimals)
+
+    # Build transfer TX
+    nonce = w3.eth.get_transaction_count(sender, "pending")
+    tx = contract.functions.transfer(recipient, amount_raw).build_transaction({
+        "from": sender,
+        "nonce": nonce,
+        "chainId": chain_id,
+    })
+
+    # EIP-1559 gas
+    try:
+        latest = w3.eth.get_block("latest")
+        if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
+            tx["maxFeePerGas"] = latest.baseFeePerGas * 2
+            tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+    except Exception:
+        pass
+
+    # Sign and send
+    signed = w3.eth.account.sign_transaction(tx, private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+    if receipt.status != 1:
+        raise RuntimeError(f"Transfer TX reverted: {tx_hash.hex()}")
+
+    # Update state
+    state["position_usd"] = round(state["position_usd"] - amount_usd, 2)
+    save_state(state)
+
+    return {
+        "tx_hash": tx_hash.hex(),
+        "amount": amount_usd,
+        "to": to_address,
+        "token": token,
+    }
+
 
 def check_onchain_balance(
     chain_id: int, wallet_address: str, rpc_url: str, token: str = "USDC",

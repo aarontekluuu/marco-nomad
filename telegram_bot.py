@@ -66,6 +66,7 @@ class MarcoBot:
         self.app.add_handler(CommandHandler("wallet", self._cmd_wallet))
         self.app.add_handler(CommandHandler("pause", self._cmd_pause))
         self.app.add_handler(CommandHandler("resume", self._cmd_resume))
+        self.app.add_handler(CommandHandler("withdraw", self._cmd_withdraw))
         self.app.add_handler(CommandHandler("help", self._cmd_start))
         # Catch-all: ignore non-command messages silently (no prompt injection surface)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._ignore))
@@ -108,6 +109,7 @@ class MarcoBot:
             "/migrate — force evaluation cycle\n"
             "/pause — pause the agent loop\n"
             "/resume — resume the agent loop\n"
+            "/withdraw &lt;address&gt; &lt;amount&gt; — send funds to owner\n"
             "/help — this message",
             parse_mode="HTML",
         )
@@ -481,6 +483,69 @@ class MarcoBot:
             await update.message.reply_text("▶️ Marco is back! Next cycle will run on schedule.")
         else:
             await update.message.reply_text("⚠️ Agent loop not connected.")
+
+    async def _cmd_withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Withdraw funds to a pre-approved owner address.
+
+        Usage: /withdraw <address> <amount>
+        Only sends to addresses in OWNER_ADDRESSES env var.
+        """
+        if await self._reject_unauthorized(update):
+            return
+        from wallet import load_state, load_wallet, withdraw, OWNER_ADDRESSES
+
+        if not OWNER_ADDRESSES:
+            await update.message.reply_text(
+                "⚠️ No OWNER_ADDRESSES configured in .env.\n"
+                "Set OWNER_ADDRESSES=0x... before withdrawing."
+            )
+            return
+
+        args = context.args
+        if not args or len(args) < 2:
+            approved = ", ".join(f"<code>{_escape(a[:10])}...</code>" for a in OWNER_ADDRESSES)
+            await update.message.reply_text(
+                "💸 <b>Withdraw Funds</b>\n\n"
+                f"Usage: <code>/withdraw &lt;address&gt; &lt;amount&gt;</code>\n\n"
+                f"Approved addresses: {approved}\n"
+                "Amount in USD (e.g. 5.00)",
+                parse_mode="HTML",
+            )
+            return
+
+        to_address = args[0].strip()
+        try:
+            amount = float(args[1])
+        except ValueError:
+            await update.message.reply_text(f"Invalid amount: {_escape(args[1])}")
+            return
+
+        wallet_info = load_wallet()
+        if not wallet_info:
+            await update.message.reply_text("⚠️ No wallet configured.")
+            return
+
+        state = load_state()
+        _, private_key = wallet_info
+
+        await update.message.reply_text(
+            f"💸 Sending ${amount:.2f} to {_escape(to_address[:10])}...{_escape(to_address[-6:])}..."
+        )
+
+        try:
+            import asyncio
+            result = await asyncio.to_thread(
+                withdraw, state, to_address, amount, private_key,
+            )
+            await update.message.reply_text(
+                f"💸 <b>Withdrawal Complete</b>\n\n"
+                f"Amount: <b>${result['amount']:.2f} {_escape(result['token'])}</b>\n"
+                f"To: <code>{_escape(result['to'])}</code>\n"
+                f"TX: <code>{_escape(result['tx_hash'])}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Withdrawal failed: {_escape(str(e))}")
 
     async def send_journal(self, entry: str):
         """Post a journal entry to the chat. All content escaped."""
