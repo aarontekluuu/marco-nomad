@@ -208,12 +208,17 @@ with right:
             pool_sym = m.get("pool_symbol", "?")
             pool_proj = m.get("pool_project", "?").title()
             reason = m.get("reason", "")
+            move_type = m.get("type", "bridge")
+            from_tok = m.get("from_token", "USDC")
+            to_tok = m.get("to_token", "USDC")
+            type_label = "Swap" if move_type == "swap" else "Bridge"
+            tok_label = f" ({from_tok}→{to_tok})" if from_tok != to_tok else ""
 
             st.markdown(f'''
 <div class="migration-card">
-    <div class="m-route">{from_emoji} {from_name} → {to_emoji} {to_name}</div>
+    <div class="m-route">{from_emoji} {from_name} → {to_emoji} {to_name}{tok_label}</div>
     <div class="m-detail">
-        {pool_sym} on {pool_proj} · {apy:.1f}% APY · Bridge: ${cost:.2f} via LI.FI
+        {pool_sym} on {pool_proj} · {apy:.1f}% APY · {type_label}: ${cost:.2f} via LI.FI
     </div>
     <div class="m-reason">{reason[:150]}</div>
 </div>

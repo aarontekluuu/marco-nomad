@@ -243,7 +243,7 @@ marco-nomad/
 ├── main.py            # Alternative entry with Telegram bot integration
 ├── demo/              # Seed data for dashboard (works without API keys)
 ├── tests/
-│   └── test_core.py   # 89 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
+│   └── test_core.py   # 91 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```

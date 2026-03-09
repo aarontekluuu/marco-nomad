@@ -61,6 +61,7 @@ class MarcoBot:
         self.app.add_handler(CommandHandler("migrate", self._cmd_migrate))
         self.app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
         self.app.add_handler(CommandHandler("scan", self._cmd_scan))
+        self.app.add_handler(CommandHandler("quote", self._cmd_quote))
         self.app.add_handler(CommandHandler("fund", self._cmd_fund))
         self.app.add_handler(CommandHandler("help", self._cmd_start))
         # Catch-all: ignore non-command messages silently (no prompt injection surface)
@@ -98,6 +99,7 @@ class MarcoBot:
             "/portfolio — detailed balances\n"
             "/journal — recent decisions\n"
             "/scan — live yield scanner\n"
+            "/quote &lt;chain&gt; — bridge cost estimate\n"
             "/fund — deposit address + safety info\n"
             "/migrate — force evaluation cycle\n"
             "/help — this message",
@@ -272,6 +274,96 @@ class MarcoBot:
             await update.message.reply_text(msg, parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"Scan failed: {_escape(str(e))}")
+
+    async def _cmd_quote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Get a LI.FI bridge/swap quote to a target chain. Usage: /quote <chain_name>"""
+        if await self._reject_unauthorized(update):
+            return
+
+        from wallet import load_state, USDC
+        from yield_scanner import CHAIN_MAP, CHAIN_MAP_REVERSE
+
+        args = context.args
+        if not args:
+            chains = ", ".join(sorted(CHAIN_MAP.values()))
+            await update.message.reply_text(
+                "💱 <b>Get a Bridge Quote</b>\n\n"
+                f"Usage: <code>/quote &lt;chain&gt;</code>\n\n"
+                f"Supported chains: {_escape(chains)}",
+                parse_mode="HTML",
+            )
+            return
+
+        target_name = " ".join(args).strip().title()
+        target_chain = CHAIN_MAP_REVERSE.get(target_name)
+        if target_chain is None:
+            await update.message.reply_text(
+                f"Unknown chain: {_escape(target_name)}\n"
+                f"Try: Base, Optimism, Arbitrum, Polygon"
+            )
+            return
+
+        state = load_state()
+        current_chain = state.get("current_chain", 8453)
+        position = state.get("position_usd", 0)
+        current_token = state.get("current_token", "USDC")
+
+        if target_chain == current_chain:
+            await update.message.reply_text("You're already on that chain.")
+            return
+
+        from_token_addr = USDC.get(current_chain)
+        to_token_addr = USDC.get(target_chain)
+        if not from_token_addr or not to_token_addr:
+            await update.message.reply_text("USDC not supported on one of those chains.")
+            return
+
+        await update.message.reply_text(
+            f"💱 Getting LI.FI quote: {_escape(CHAIN_MAP.get(current_chain, '?'))} → "
+            f"{_escape(target_name)}..."
+        )
+
+        try:
+            import httpx
+            from lifi import get_quote, calc_bridge_cost
+
+            amount_raw = str(int(position * 1e6))  # USDC 6 decimals
+            addr = state.get("address", "0x" + "0" * 40)
+
+            async with httpx.AsyncClient() as client:
+                quote = await get_quote(
+                    client,
+                    from_chain=current_chain,
+                    to_chain=target_chain,
+                    from_token=from_token_addr,
+                    to_token=to_token_addr,
+                    from_amount=amount_raw,
+                    from_address=addr,
+                )
+            cost = calc_bridge_cost(quote)
+            cost_pct = (cost["total_cost_usd"] / position * 100) if position else 0
+            duration = cost.get("duration_seconds", 0)
+            dur_str = f"{duration}s" if duration < 60 else f"{duration // 60}m {duration % 60}s"
+
+            lines = [
+                f"💱 <b>Quote: {_escape(CHAIN_MAP.get(current_chain, '?'))} → "
+                f"{_escape(target_name)}</b>\n",
+                f"Amount: <b>${position:.2f}</b> {_escape(current_token)}",
+                f"You receive: <b>${cost['to_amount']:.2f}</b>",
+                f"Min receive: ${cost['to_amount_min']:.2f}",
+                f"",
+                f"<b>Costs:</b>",
+                f"  Fees: ${cost['fee_usd']:.4f}",
+                f"  Gas: ${cost['gas_usd']:.4f}",
+                f"  Spread: ${cost['spread_usd']:.4f}",
+                f"  Total: <b>${cost['total_cost_usd']:.4f}</b> ({cost_pct:.2f}%)",
+                f"",
+                f"Bridge: <b>{_escape(cost['bridge'])}</b>",
+                f"Duration: ~{dur_str}",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"Quote failed: {_escape(str(e))}")
 
     async def _cmd_fund(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show deposit address and safety information for funding the agent wallet."""

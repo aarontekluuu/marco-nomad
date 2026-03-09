@@ -864,3 +864,27 @@ class TestTelegramSecurity:
         assert "import html" in bot_code
         assert "_escape" in bot_code
         assert "html.escape" in bot_code
+
+    def test_quote_command_registered(self):
+        """Bot should register the /quote command handler."""
+        from pathlib import Path
+        bot_code = (Path(__file__).parent.parent / "telegram_bot.py").read_text()
+        assert '"quote"' in bot_code or "'quote'" in bot_code
+        assert "_cmd_quote" in bot_code
+
+    def test_all_commands_have_auth_check(self):
+        """Every _cmd_ method should call _reject_unauthorized."""
+        from pathlib import Path
+        import re
+        bot_code = (Path(__file__).parent.parent / "telegram_bot.py").read_text()
+        cmd_methods = re.findall(r"async def (_cmd_\w+)", bot_code)
+        # Exclude _cmd_start (uses same handler as help) — actually it does check
+        for method in cmd_methods:
+            if method == "_cmd_start":
+                continue
+            # Find the method body — next 5 lines should contain reject_unauthorized
+            pattern = rf"async def {method}\(.*?\).*?(?=async def |class |\Z)"
+            match = re.search(pattern, bot_code, re.DOTALL)
+            if match:
+                body = match.group()[:500]  # First 500 chars of method
+                assert "_reject_unauthorized" in body, f"{method} missing auth check"
