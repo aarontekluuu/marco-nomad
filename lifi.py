@@ -131,10 +131,18 @@ def calc_bridge_cost(quote: dict) -> dict:
     to_human = to_amount / (10 ** to_decimals) if to_amount else 0
     to_min_human = to_amount_min / (10 ** to_decimals) if to_amount_min else 0
 
+    # True cost includes fees, gas, AND the spread (fromAmount - toAmount)
+    # feeCosts/gasCosts only capture explicit charges, not bridge spread
+    spread_loss = (from_human - to_human) if from_human and to_human else 0
+    # Use the higher of (fees+gas) vs spread as the real cost —
+    # spread already includes fees baked into the exchange rate
+    effective_cost_usd = max(total_cost_usd, spread_loss) if spread_loss > 0 else total_cost_usd
+
     return {
         "fee_usd": total_fee_usd,
         "gas_usd": total_gas_usd,
-        "total_cost_usd": total_cost_usd,
+        "spread_usd": max(spread_loss, 0),
+        "total_cost_usd": effective_cost_usd,
         "from_amount": from_human,
         "to_amount": to_human,
         "to_amount_min": to_min_human,

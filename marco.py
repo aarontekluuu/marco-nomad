@@ -168,6 +168,17 @@ async def run_cycle():
             for move in decision["moves"]:
                 to_chain_name = move.get("to_chain", "")
                 target_chain_id = CHAIN_MAP_REVERSE.get(to_chain_name)
+
+                # Fuzzy match: brain might output "Arbitrum One" instead of "Arbitrum"
+                if not target_chain_id:
+                    to_lower = to_chain_name.lower()
+                    for known_name, chain_id in CHAIN_MAP_REVERSE.items():
+                        if to_lower in known_name.lower() or known_name.lower() in to_lower:
+                            target_chain_id = chain_id
+                            to_chain_name = known_name  # Normalize to exact name
+                            log(f"  Fuzzy matched '{move.get('to_chain')}' -> '{known_name}'")
+                            break
+
                 target_pool = next(
                     (p for p in candidates if p.get("chain") == to_chain_name), None
                 )
@@ -210,11 +221,30 @@ async def run_cycle():
                             log(f"  BLOCKED: fresh quote cost {fresh_cost_pct:.2f}% exceeds limit")
                             continue
                         cost_usd = fresh_cost["total_cost_usd"]
-                        log(f"  Fresh quote: ${cost_usd:.2f} via {fresh_cost['bridge']}")
+                        log(f"  Fresh quote: ${cost_usd:.2f} ({fresh_cost.get('spread_usd', 0):.2f} spread) via {fresh_cost['bridge']}")
                     except Exception as e:
                         log(f"  Fresh quote failed ({e}), aborting migration to {to_chain_name}")
                         continue
-                    log(f"  Executing migration to {to_chain_name}...")
+
+                    # Execute the bridge transaction on-chain
+                    private_key = os.getenv("WALLET_PRIVATE_KEY")
+                    rpc_url = lifi.RPC_URLS.get(current_chain)
+                    if not private_key or not rpc_url:
+                        log(f"  ABORT: Missing WALLET_PRIVATE_KEY or RPC URL for chain {current_chain}")
+                        continue
+                    log(f"  Executing bridge to {to_chain_name}...")
+                    try:
+                        tx_result = await lifi.execute_quote(
+                            fresh_quote, private_key, rpc_url,
+                            poll_status_client=client, api_key=LIFI_API_KEY,
+                        )
+                        log(f"  TX: {tx_result['tx_hash']} status={tx_result['status']}")
+                        if tx_result["status"] == "FAILED":
+                            log(f"  Bridge TX FAILED — not recording migration")
+                            continue
+                    except Exception as e:
+                        log(f"  Bridge execution failed: {e}")
+                        continue
 
                 # Record migration and deduct bridge cost from position
                 wallet.record_migration(
