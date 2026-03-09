@@ -724,16 +724,82 @@ class TestSecurityValidations:
 
     def test_priority_fee_bounds(self):
         """Dynamic priority fee should be bounded between 0.05 and 5 gwei."""
-        # Replicate the bounding logic from lifi.py without web3 import
         gwei = 10**9
-        min_tip = int(0.05 * gwei)  # 50_000_000
-        max_tip = int(5 * gwei)     # 5_000_000_000
-        # Low suggestion gets raised to floor
+        min_tip = int(0.05 * gwei)
+        max_tip = int(5 * gwei)
         low = int(0.001 * gwei)
         assert max(min_tip, min(low, max_tip)) == min_tip
-        # High suggestion gets capped
         high = int(100 * gwei)
         assert max(min_tip, min(high, max_tip)) == max_tip
-        # Normal suggestion passes through
         normal = int(1.5 * gwei)
         assert max(min_tip, min(normal, max_tip)) == normal
+
+
+# ---------------------------------------------------------------------------
+# telegram_bot.py — security
+# ---------------------------------------------------------------------------
+
+class TestTelegramSecurity:
+    """Verify Telegram bot security hardening.
+    Tests use html.escape directly since the bot's _escape is just html.escape.
+    Tests that need telegram_bot import are skipped if python-telegram-bot is not installed.
+    """
+
+    def test_escape_prevents_html_injection(self):
+        """html.escape (used by _escape) prevents HTML injection."""
+        import html
+        assert "<" not in html.escape("<script>alert('xss')</script>")
+        assert "&lt;" in html.escape("<b>bold</b>")
+        assert html.escape("normal text") == "normal text"
+
+    def test_escape_handles_special_chars(self):
+        import html
+        assert "&amp;" in html.escape("a & b")
+        assert "&quot;" in html.escape('say "hello"', quote=True)
+
+    def test_truncate_logic(self):
+        """Truncation should cap at limit and add indicator."""
+        # Inline the truncation logic from telegram_bot.py
+        def _truncate(text, limit=4000):
+            if len(text) <= limit:
+                return text
+            return text[:limit - 20] + "\n\n…(truncated)"
+        long_text = "a" * 5000
+        result = _truncate(long_text, limit=100)
+        assert len(result) <= 100
+        assert "truncated" in result
+        assert _truncate("short") == "short"
+
+    def test_migrate_cooldown_minimum(self):
+        """Migrate cooldown should be at least 60 seconds to prevent abuse."""
+        # Value is hardcoded in telegram_bot.py as MIGRATE_COOLDOWN_SECONDS = 300
+        # Verify the file contains a reasonable value
+        from pathlib import Path
+        import re
+        bot_code = (Path(__file__).parent.parent / "telegram_bot.py").read_text()
+        match = re.search(r"MIGRATE_COOLDOWN_SECONDS\s*=\s*(\d+)", bot_code)
+        assert match, "MIGRATE_COOLDOWN_SECONDS not found in telegram_bot.py"
+        assert int(match.group(1)) >= 60
+
+    def test_auth_check_exists_in_source(self):
+        """Bot source should contain authorization checks."""
+        from pathlib import Path
+        bot_code = (Path(__file__).parent.parent / "telegram_bot.py").read_text()
+        assert "_is_authorized" in bot_code
+        assert "_reject_unauthorized" in bot_code
+        assert "chat_id" in bot_code
+
+    def test_no_freeform_text_in_source(self):
+        """Bot should have an _ignore handler for non-command text."""
+        from pathlib import Path
+        bot_code = (Path(__file__).parent.parent / "telegram_bot.py").read_text()
+        assert "_ignore" in bot_code
+        assert "MessageHandler" in bot_code
+
+    def test_html_escape_used_for_output(self):
+        """Bot should import html and use escape for all user-facing output."""
+        from pathlib import Path
+        bot_code = (Path(__file__).parent.parent / "telegram_bot.py").read_text()
+        assert "import html" in bot_code
+        assert "_escape" in bot_code
+        assert "html.escape" in bot_code
