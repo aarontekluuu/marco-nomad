@@ -263,9 +263,14 @@ async def execute_quote(
             signed = w3.eth.account.sign_transaction(approve_tx, private_key)
             w3.eth.send_raw_transaction(signed.raw_transaction)
             # Run sync web3 call in thread to avoid blocking the event loop
-            await asyncio.to_thread(
+            approve_receipt = await asyncio.to_thread(
                 w3.eth.wait_for_transaction_receipt, signed.hash, timeout=120
             )
+            if approve_receipt.status != 1:
+                raise RuntimeError(
+                    f"ERC20 approval TX reverted (hash: {signed.hash.hex()}). "
+                    f"Cannot proceed with bridge — token may block re-approval without resetting to 0."
+                )
 
     # 2. Build TX with EIP-1559 gas if available, fallback to legacy
     nonce = w3.eth.get_transaction_count(sender, "pending")
@@ -274,7 +279,7 @@ async def execute_quote(
         "to": Web3.to_checksum_address(tx["to"]),
         "data": tx["data"],
         "value": _parse_int(tx.get("value", 0)),
-        "gas": _parse_int(tx.get("gasLimit", tx.get("gas", 200000))),
+        "gas": _parse_int(tx.get("gasLimit", tx.get("gas", 500000))),
         "nonce": nonce,
         "chainId": tx.get("chainId", w3.eth.chain_id),
     }
@@ -291,19 +296,28 @@ async def execute_quote(
         if "gasPrice" in tx:
             send_tx["gasPrice"] = _parse_int(tx["gasPrice"])
 
-    # 3. Sign and send
+    # 3. Simulate TX before signing (catches reverts without spending gas)
+    sim_tx = {k: v for k, v in send_tx.items() if k not in ("nonce", "chainId")}
+    try:
+        w3.eth.call(sim_tx, "latest")
+    except Exception as e:
+        raise RuntimeError(
+            f"TX simulation reverted — would fail on-chain and waste gas. Error: {e}"
+        )
+
+    # 4. Sign and send
     signed = w3.eth.account.sign_transaction(send_tx, private_key)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     tx_hash_hex = tx_hash.hex()
 
-    # 4. Wait for on-chain confirmation (in thread — web3 HTTPProvider is sync)
+    # 5. Wait for on-chain confirmation (in thread — web3 HTTPProvider is sync)
     receipt = await asyncio.to_thread(
         w3.eth.wait_for_transaction_receipt, tx_hash, timeout=300
     )
     if receipt.status != 1:
         return {"tx_hash": tx_hash_hex, "status": "FAILED", "receipt": dict(receipt)}
 
-    # 5. Poll LI.FI bridge status until complete
+    # 6. Poll LI.FI bridge status with exponential backoff
     result = {"tx_hash": tx_hash_hex, "status": "PENDING", "receipt": dict(receipt)}
 
     if poll_status_client:
@@ -311,14 +325,21 @@ async def execute_quote(
         from_chain = quote.get("action", {}).get("fromChainId")
         to_chain = quote.get("action", {}).get("toChainId")
 
-        for attempt in range(60):  # Poll for up to 5 minutes
-            await asyncio.sleep(5)
+        delay = 5  # Start at 5s, cap at 30s
+        consecutive_errors = 0
+        elapsed = 0
+        max_poll_seconds = 600  # 10 min max for cross-chain bridges
+
+        while elapsed < max_poll_seconds:
+            await asyncio.sleep(delay)
+            elapsed += delay
             try:
                 status = await check_status(
                     poll_status_client, tx_hash_hex,
                     from_chain=from_chain, to_chain=to_chain,
                     bridge=bridge, api_key=api_key,
                 )
+                consecutive_errors = 0
                 bridge_status = status.get("status", "PENDING")
                 if bridge_status == "DONE":
                     result["status"] = "DONE"
@@ -327,7 +348,10 @@ async def execute_quote(
                     result["status"] = "FAILED"
                     break
             except Exception:
-                continue
+                consecutive_errors += 1
+                if consecutive_errors >= 5:
+                    break  # Stop polling but don't mark failed — TX may still land
+            delay = min(delay * 2, 30)  # Backoff: 5 -> 10 -> 20 -> 30s cap
 
     return result
 
@@ -335,15 +359,12 @@ async def execute_quote(
 # Known LI.FI router/diamond contract addresses per chain
 # Validate TX destination against these to prevent signing malicious TXs
 # Source: https://docs.li.fi/smart-contracts/deployments
-LIFI_DIAMOND = {
-    1: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-    8453: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-    42161: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-    10: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-    137: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-    56: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-    43114: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
-}
+# LI.FI uses CREATE2 deterministic deployment — same address on all EVM chains
+_LIFI_DIAMOND_ADDR = "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE"
+LIFI_DIAMOND = {chain_id: _LIFI_DIAMOND_ADDR for chain_id in [
+    1, 8453, 42161, 10, 137, 56, 43114,  # Original 7
+    250, 324, 59144, 534352,              # Fantom, zkSync, Linea, Scroll
+]}
 
 RPC_URLS = {
     1: "https://eth.llamarpc.com",

@@ -183,7 +183,8 @@ async def run_cycle():
         if decision.get("action") == "migrate" and decision.get("moves") and confidence < MIN_CONFIDENCE:
             log(f"  BLOCKED: confidence {confidence:.0%} < {MIN_CONFIDENCE:.0%} threshold — holding instead")
         elif decision.get("action") == "migrate" and decision.get("moves"):
-            for move in decision["moves"]:
+            # Single-position model: only execute the first move
+            for move in decision["moves"][:1]:
                 to_chain_name = move.get("to_chain", "")
                 target_chain_id = CHAIN_MAP_REVERSE.get(to_chain_name)
 
@@ -212,11 +213,8 @@ async def run_cycle():
 
                 cost_usd = quote_data["cost"]["total_cost_usd"] if quote_data else 0
 
-                # Respect brain's amount_pct (partial moves instead of always full position)
-                move_pct = min(max(move.get("amount_pct", 1.0), 0.1), 1.0)
-                move_usd = position_usd * move_pct
-                if move_pct < 1.0:
-                    log(f"  Partial move: {move_pct:.0%} of position (${move_usd:.2f})")
+                # Full position move — wallet model is single-chain
+                move_usd = position_usd
 
                 # Safety check: min balance and migration cooldown
                 allowed, block_reason = wallet.can_migrate(state, cost_usd)

@@ -102,10 +102,12 @@ def filter_pools(
         if no_il_risk and p.get("ilRisk") == "yes":
             continue
 
+        # Shallow copy so we don't mutate cached pool objects
+        p = {**p}
+
         # Detect suspicious APY spikes: current >> 30-day average
         mean30d = p.get("apyMean30d") or 0
-        if mean30d > 0 and apy / mean30d > MAX_APY_SPIKE_RATIO:
-            p["_apy_spike"] = True  # Flag for brain context, don't hard-exclude
+        p["_apy_spike"] = mean30d > 0 and apy / mean30d > MAX_APY_SPIKE_RATIO
 
         # Mark protocol trust level
         project = (p.get("project") or "").lower()
