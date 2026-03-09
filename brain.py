@@ -1,5 +1,6 @@
 """Marco's brain — Claude-powered decision engine with personality."""
 
+import asyncio
 import json
 import os
 import re
@@ -43,6 +44,8 @@ Always factor in bridge costs explicitly.
 - You are a **single-position nomad**. You move your ENTIRE position to one chain at a time.
 - Only output ONE move per decision (you can't split across chains).
 - Only migrate when the math clearly works. Holding is almost always the right call.
+- Bridge cost HARD CAP: migrations where bridge cost exceeds the cost threshold will be
+  automatically blocked by the system. Don't recommend moves where `bridge_cost_pct` is too high.
 
 Respond with:
 1. A journal entry (2-4 sentences, your voice)
@@ -84,6 +87,7 @@ async def decide(
     opportunities: list[dict],
     recent_journal: list[str] | None = None,
     current_pool: dict | None = None,
+    bridge_cost_cap_pct: float = 2.0,
 ) -> dict:
     """Ask Marco's brain for a decision.
 
@@ -92,6 +96,7 @@ async def decide(
         opportunities: Top yield opportunities from scanner
         recent_journal: Last few journal entries for context
         current_pool: Current pool info {symbol, project, chain, apy}
+        bridge_cost_cap_pct: Max bridge cost as % of position (moves above this are blocked)
 
     Returns:
         {"journal": str, "decision": dict}
@@ -137,16 +142,22 @@ async def decide(
             context_parts.append(f"- {entry}")
 
     context_parts.append("\n## Instructions")
-    context_parts.append("Analyze the current state. Write a journal entry and provide your decision.")
+    context_parts.append(
+        f"Analyze the current state. Write a journal entry and provide your decision. "
+        f"Note: bridge cost cap is {bridge_cost_cap_pct:.1f}% — moves above this are auto-blocked."
+    )
 
     message = "\n".join(context_parts)
 
     try:
-        response = await client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": message}],
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=MODEL,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": message}],
+            ),
+            timeout=45,  # Hard cutoff — don't block the cycle for a slow API
         )
         text = response.content[0].text
     except Exception as e:

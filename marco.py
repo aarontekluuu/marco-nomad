@@ -162,17 +162,20 @@ async def run_cycle():
                 log(f"     WARNING: exceeds {MAX_BRIDGE_COST_PCT}% threshold")
 
         # 3. Refresh current pool APY from live data (stored APY is from migration time)
+        # Search ALL pools (not just filtered candidates) because the current pool's
+        # APY might have dropped below MIN_APY — exactly when we need accurate data
         current_pool = state.get("current_pool")
         if current_pool:
+            all_pools = yield_scanner._pool_cache  # Already fetched by scan_yields
             pool_id = current_pool.get("pool_id")
             live_match = next(
-                (p for p in candidates if p.get("pool") == pool_id),
+                (p for p in all_pools if p.get("pool") == pool_id),
                 None,
             ) if pool_id else None
             # Fallback: match by symbol + project + chain
             if not live_match:
                 live_match = next(
-                    (p for p in candidates
+                    (p for p in all_pools
                      if p.get("symbol") == current_pool.get("symbol")
                      and p.get("project") == current_pool.get("project")
                      and p.get("chain") == current_pool.get("chain")),
@@ -201,7 +204,11 @@ async def run_cycle():
         # 6. Ask Marco's brain
         log("Marco is thinking...")
         journal_entries = load_journal()
-        result = await brain.decide(portfolio, candidates, journal_entries[-3:], current_pool=state.get("current_pool"))
+        result = await brain.decide(
+            portfolio, candidates, journal_entries[-3:],
+            current_pool=state.get("current_pool"),
+            bridge_cost_cap_pct=MAX_BRIDGE_COST_PCT,
+        )
 
         journal_text = result["journal"]
         decision = result["decision"]
