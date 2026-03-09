@@ -1,5 +1,6 @@
 """DefiLlama yield scanner - finds best yields across chains."""
 
+import asyncio
 import time
 
 import httpx
@@ -34,8 +35,19 @@ async def fetch_pools(client: httpx.AsyncClient) -> list[dict]:
     global _pool_cache, _pool_cache_ts
     if _pool_cache and (time.time() - _pool_cache_ts) < CACHE_TTL:
         return _pool_cache
-    resp = await client.get(POOLS_URL, timeout=30)
-    resp.raise_for_status()
+    # Retry once on timeout — DefiLlama's 5-10MB response can be slow
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = await client.get(POOLS_URL, timeout=30)
+            resp.raise_for_status()
+            break
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            last_err = e
+            if attempt == 0:
+                await asyncio.sleep(2)
+    else:
+        raise last_err  # type: ignore[misc]
     body = resp.json()
     if not isinstance(body, dict) or "data" not in body:
         raise ValueError(f"Unexpected DefiLlama response: {str(body)[:200]}")

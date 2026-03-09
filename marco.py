@@ -36,6 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 JOURNAL_FILE = Path(__file__).parent / "journal.json"
+MAX_JOURNAL_ENTRIES = 100
 
 
 def load_journal() -> list[str]:
@@ -45,6 +46,9 @@ def load_journal() -> list[str]:
 
 
 def save_journal(entries: list[str]):
+    # Cap journal size — keep most recent entries
+    if len(entries) > MAX_JOURNAL_ENTRIES:
+        entries = entries[-MAX_JOURNAL_ENTRIES:]
     JOURNAL_FILE.write_text(json.dumps(entries, indent=2))
 
 
