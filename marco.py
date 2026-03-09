@@ -76,6 +76,14 @@ async def run_cycle():
     state = wallet.load_state()
     log(f"Current state:\n{wallet.format_state(state)}")
 
+    # Reconcile tracked balance with on-chain reality (LIVE mode only)
+    if not DEMO_MODE:
+        rpc_url = lifi.RPC_URLS.get(state["current_chain"])
+        if rpc_url:
+            drift = wallet.reconcile_balance(state, rpc_url)
+            if drift is not None and abs(drift) > 0.01:
+                log(f"Balance reconciled: drift was ${drift:+.2f} (now ${state['position_usd']:.2f})")
+
     async with httpx.AsyncClient() as client:
         # 1. Scan yields
         log("Scanning yields...")

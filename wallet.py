@@ -100,6 +100,55 @@ def record_migration(state: dict, from_chain: int, to_chain: int, pool: dict, co
     save_state(state)
 
 
+BALANCE_OF_ABI = [
+    {
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+]
+
+
+def check_onchain_balance(chain_id: int, wallet_address: str, rpc_url: str) -> float | None:
+    """Query actual USDC balance on-chain. Returns USD amount or None on failure."""
+    try:
+        from web3 import Web3
+        usdc_addr = USDC.get(chain_id)
+        if not usdc_addr or not wallet_address:
+            return None
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(usdc_addr),
+            abi=BALANCE_OF_ABI,
+        )
+        raw = contract.functions.balanceOf(
+            Web3.to_checksum_address(wallet_address)
+        ).call()
+        return raw / (10 ** USDC_DECIMALS)
+    except Exception:
+        return None
+
+
+def reconcile_balance(state: dict, rpc_url: str) -> float | None:
+    """Compare tracked position_usd with on-chain balance. Returns drift or None."""
+    actual = check_onchain_balance(
+        state["current_chain"],
+        state.get("address", ""),
+        rpc_url,
+    )
+    if actual is None:
+        return None
+    tracked = state.get("position_usd", 0)
+    drift = actual - tracked
+    if abs(drift) > 0.01:  # More than 1 cent drift
+        state["position_usd"] = round(actual, 2)
+        state["_last_reconcile"] = datetime.now().isoformat()
+        state["_last_drift_usd"] = round(drift, 4)
+        save_state(state)
+    return drift
+
+
 def format_state(state: dict) -> str:
     """Format current wallet state for display."""
     pool = state.get("current_pool")

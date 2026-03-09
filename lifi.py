@@ -222,6 +222,16 @@ async def execute_quote(
     sender = Web3.to_checksum_address(tx["from"])
     from_amount = int(quote["action"]["fromAmount"])
 
+    # SECURITY: Validate TX destination is a known LI.FI contract
+    tx_to = Web3.to_checksum_address(tx["to"])
+    chain_id = tx.get("chainId", w3.eth.chain_id)
+    known_diamond = LIFI_DIAMOND.get(chain_id)
+    if known_diamond and tx_to.lower() != known_diamond.lower():
+        raise ValueError(
+            f"TX destination {tx_to} does not match known LI.FI diamond "
+            f"{known_diamond} on chain {chain_id}. Refusing to sign — possible API compromise."
+        )
+
     # 1. Check existing allowance before approving (saves gas on repeat bridges)
     approval_addr = quote["estimate"].get("approvalAddress")
     from_token = quote["action"]["fromToken"]["address"]
@@ -237,13 +247,25 @@ async def execute_quote(
         if current_allowance < from_amount:
             # Approve exact amount — MAX_UINT256 is a security risk if router is compromised
             nonce = w3.eth.get_transaction_count(sender, "pending")
+            approve_build = {"from": sender, "nonce": nonce}
+            # Use EIP-1559 for approval TX too (same MEV protection as bridge TX)
+            try:
+                latest = w3.eth.get_block("latest")
+                if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
+                    approve_build["maxFeePerGas"] = latest.baseFeePerGas * 2
+                    approve_build["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+            except Exception:
+                pass
             approve_tx = erc20.functions.approve(
                 Web3.to_checksum_address(approval_addr),
                 from_amount,
-            ).build_transaction({"from": sender, "nonce": nonce})
+            ).build_transaction(approve_build)
             signed = w3.eth.account.sign_transaction(approve_tx, private_key)
             w3.eth.send_raw_transaction(signed.raw_transaction)
-            w3.eth.wait_for_transaction_receipt(signed.hash, timeout=120)
+            # Run sync web3 call in thread to avoid blocking the event loop
+            await asyncio.to_thread(
+                w3.eth.wait_for_transaction_receipt, signed.hash, timeout=120
+            )
 
     # 2. Build TX with EIP-1559 gas if available, fallback to legacy
     nonce = w3.eth.get_transaction_count(sender, "pending")
@@ -274,8 +296,10 @@ async def execute_quote(
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     tx_hash_hex = tx_hash.hex()
 
-    # 4. Wait for on-chain confirmation
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    # 4. Wait for on-chain confirmation (in thread — web3 HTTPProvider is sync)
+    receipt = await asyncio.to_thread(
+        w3.eth.wait_for_transaction_receipt, tx_hash, timeout=300
+    )
     if receipt.status != 1:
         return {"tx_hash": tx_hash_hex, "status": "FAILED", "receipt": dict(receipt)}
 
@@ -307,6 +331,19 @@ async def execute_quote(
 
     return result
 
+
+# Known LI.FI router/diamond contract addresses per chain
+# Validate TX destination against these to prevent signing malicious TXs
+# Source: https://docs.li.fi/smart-contracts/deployments
+LIFI_DIAMOND = {
+    1: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+    8453: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+    42161: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+    10: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+    137: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+    56: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+    43114: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+}
 
 RPC_URLS = {
     1: "https://eth.llamarpc.com",
