@@ -47,10 +47,15 @@ class MarcoBot:
         await update.message.reply_text(f"📍 Marco's Position\n\n{format_state(state)}")
 
     async def _cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.agent:
-            await update.message.reply_text("No journal entries yet.")
-            return
-        entries = self.agent.get("journal", [])[-5:]
+        import json
+        from pathlib import Path
+        journal_file = Path(__file__).parent / "journal.json"
+        entries = []
+        if journal_file.exists():
+            try:
+                entries = json.loads(journal_file.read_text())[-5:]
+            except (json.JSONDecodeError, OSError):
+                pass
         if not entries:
             await update.message.reply_text("No journal entries yet. I'm still scouting.")
             return
@@ -93,7 +98,7 @@ class MarcoBot:
         moves = decision.get("moves", [])
         move_text = ""
         for m in moves:
-            move_text += f"\n  {m['from_chain']} → {m['to_chain']} ({int(m['amount_pct']*100)}%) — {m['reason']}"
+            move_text += f"\n  {m.get('from_chain', '?')} → {m.get('to_chain', '?')} — {m.get('reason', '')}"
 
         confidence = decision.get("confidence", 0)
         action = decision.get("action", "hold")
