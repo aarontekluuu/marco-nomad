@@ -1364,3 +1364,76 @@ class TestFastBrainLimits:
         limits = [{"chain": "Arbitrum", "min_apy": 10.0}]
         match = _check_limits(opps, limits)
         assert match is None
+
+
+class TestYieldTrends:
+    """Test yield trend calculation and brain integration."""
+
+    def setup_method(self):
+        import tempfile, os
+        self._tmp = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmp, "test_yields.db")
+        import yield_db
+        self._orig_path = yield_db.DB_PATH
+        yield_db.DB_PATH = self._db_path
+
+    def teardown_method(self):
+        import shutil, yield_db
+        yield_db.DB_PATH = self._orig_path
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_insufficient_data_returns_none(self):
+        from yield_db import calc_trend
+        result = calc_trend(symbol="USDC", project="aave-v3", chain="Base")
+        assert result is None
+
+    def test_rising_trend_detected(self):
+        import time
+        from yield_db import _get_db, calc_trend
+        db = _get_db()
+        now = time.time()
+        for i in range(5):
+            db.execute(
+                "INSERT INTO yield_snapshots (timestamp, chain, project, symbol, apy, apy_mean_30d, tvl_usd, pool_id) VALUES (?,?,?,?,?,?,?,?)",
+                (now - (4 - i) * 3600, "Base", "aave-v3", "USDC", 5.0 + i * 2, 5.0, 1_000_000, "pool1"),
+            )
+        db.commit()
+        db.close()
+        trend = calc_trend(pool_id="pool1")
+        assert trend is not None
+        assert trend["is_rising"] is True
+        assert trend["slope"] > 0
+
+    def test_volatile_trend_detected(self):
+        import time
+        from yield_db import _get_db, calc_trend
+        db = _get_db()
+        now = time.time()
+        # Alternating high/low APY = volatile
+        for i in range(6):
+            apy = 20.0 if i % 2 == 0 else 5.0
+            db.execute(
+                "INSERT INTO yield_snapshots (timestamp, chain, project, symbol, apy, apy_mean_30d, tvl_usd, pool_id) VALUES (?,?,?,?,?,?,?,?)",
+                (now - (5 - i) * 3600, "Base", "merkl", "USDC", apy, 12.0, 500_000, "pool2"),
+            )
+        db.commit()
+        db.close()
+        trend = calc_trend(pool_id="pool2")
+        assert trend is not None
+        assert trend["volatility"] > 25  # High relative volatility
+
+    def test_trend_adjusts_scoring(self):
+        opp = _make_opp(apy=15.0, bridge_cost=0.01)
+        opp["_trend"] = {"is_rising": True, "slope": 1.0, "volatility": 5, "tvl_change_pct": 10, "data_points": 5, "is_stable": True}
+        score_with = _score_opportunity(opp, 5.0, 100, 7, 1.5)
+        opp2 = _make_opp(apy=15.0, bridge_cost=0.01)
+        score_without = _score_opportunity(opp2, 5.0, 100, 7, 1.5)
+        assert score_with["net_payoff"] > score_without["net_payoff"]
+
+    def test_falling_trend_penalizes(self):
+        opp = _make_opp(apy=15.0, bridge_cost=0.01)
+        opp["_trend"] = {"is_rising": False, "slope": -1.0, "volatility": 30, "tvl_change_pct": -20, "data_points": 5, "is_stable": False}
+        score = _score_opportunity(opp, 5.0, 100, 7, 1.5)
+        opp2 = _make_opp(apy=15.0, bridge_cost=0.01)
+        score_base = _score_opportunity(opp2, 5.0, 100, 7, 1.5)
+        assert score["net_payoff"] < score_base["net_payoff"]

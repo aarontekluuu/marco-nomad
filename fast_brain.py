@@ -88,6 +88,21 @@ def _score_opportunity(
     if opp.get("_multi_asset"):
         net_payoff *= 0.9
 
+    # Yield trend adjustments (from historical DB)
+    # Use additive adjustments so negative payoffs aren't inverted by multiplication
+    trend = opp.get("_trend")
+    if trend and net_payoff != 0:
+        trend_adj = 0.0
+        if trend.get("is_rising"):
+            trend_adj += abs(net_payoff) * 0.1  # Rising APY = bonus
+        elif trend.get("slope", 0) < -0.5:
+            trend_adj -= abs(net_payoff) * 0.2  # Falling fast = penalty
+        if trend.get("volatility", 0) > 25:
+            trend_adj -= abs(net_payoff) * 0.1  # Volatile = risky
+        if trend.get("tvl_change_pct", 0) < -15:
+            trend_adj -= abs(net_payoff) * 0.15  # Capital fleeing
+        net_payoff += trend_adj
+
     return {
         "opp": opp,
         "effective_apy": eff_apy,
@@ -107,6 +122,7 @@ def _calc_confidence(
     risk_score: float,
     is_trusted: bool,
     spread_pct: float,
+    trend: dict | None = None,
 ) -> float:
     """Deterministic confidence from signal strength."""
     if net_payoff <= 0:
@@ -119,7 +135,16 @@ def _calc_confidence(
     trust = 0.1 if is_trusted else 0.0
     # Spread clarity
     spread_bonus = 0.1 if spread_pct > 5.0 else 0.0
-    return min(base + risk_contrib + trust + spread_bonus, 1.0)
+    # Trend bonus/penalty
+    trend_adj = 0.0
+    if trend:
+        if trend.get("is_stable"):
+            trend_adj += 0.05
+        if trend.get("is_rising"):
+            trend_adj += 0.05
+        if trend.get("slope", 0) < -0.5:
+            trend_adj -= 0.1
+    return min(max(base + risk_contrib + trust + spread_bonus + trend_adj, 0.0), 1.0)
 
 
 def _check_limits(opportunities: list[dict], limits: list[dict]) -> dict | None:
@@ -187,10 +212,21 @@ def _build_hold_journal(
     else:
         phrase = random.choice(HOLD_PHRASES_CLOSE_SPREAD + HOLD_PHRASES_NO_OPPORTUNITY)
 
+    # Trend commentary
+    trend_note = ""
+    trend = best.get("_trend")
+    if trend and trend.get("data_points", 0) >= 3:
+        if trend.get("slope", 0) < -0.5:
+            trend_note = " APY falling fast over the week though — risky."
+        elif trend.get("is_rising"):
+            trend_note = " APY trending up too — momentum is real."
+        elif trend.get("volatility", 0) > 25:
+            trend_note = " Volatile yield though — could vanish tomorrow."
+
     return (
         f"{opener} Best I found: {best_chain} {best_project} at "
         f"{best_scored['effective_apy']:.1f}% — {best_scored['spread']:.1f}% spread, "
-        f"${best_scored['bridge_cost']:.2f} bridge. {phrase}"
+        f"${best_scored['bridge_cost']:.2f} bridge. {phrase}{trend_note}"
     )
 
 
@@ -236,10 +272,19 @@ def _build_migrate_journal(
         target_apy=best_scored["effective_apy"],
         bridge_cost=best_scored["bridge_cost"],
     )
+    # Trend commentary for migrate
+    trend_note = ""
+    trend = best.get("_trend")
+    if trend and trend.get("data_points", 0) >= 3:
+        if trend.get("is_rising"):
+            trend_note = f" Yield's been climbing for {trend['data_points']} snapshots — this isn't a fluke."
+        elif trend.get("is_stable"):
+            trend_note = " Stable yield history backs this up."
+
     return (
         f"{random.choice(openers)} "
         f"Bridge via LI.FI ({bridge_tool}): ${best_scored['bridge_cost']:.2f} "
-        f"({best_scored['bridge_pct']:.1f}%). {phrase}"
+        f"({best_scored['bridge_pct']:.1f}%). {phrase}{trend_note}"
     )
 
 
@@ -375,6 +420,7 @@ async def decide(
             best_opp.get("_risk_score", 50),
             best_opp.get("_trusted", False),
             best["spread"],
+            trend=best_opp.get("_trend"),
         )
         journal = _build_migrate_journal(current_pool, best)
         move = {

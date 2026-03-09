@@ -20,7 +20,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 CYCLE_INTERVAL = int(os.getenv("LOOP_INTERVAL", "900"))  # 15min default for autonomous mode
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 
 async def main():

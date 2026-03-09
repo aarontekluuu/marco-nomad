@@ -951,8 +951,9 @@ class MarcoBot:
                 BotCommand("kill", "Emergency stop"),
                 BotCommand("more", "Power commands"),
             ])
-        except Exception:
-            pass
+            logger.info("Telegram command menu updated")
+        except Exception as e:
+            logger.warning(f"Failed to set bot commands: {e}")
 
     async def stop(self):
         """Stop the bot."""
