@@ -1,9 +1,12 @@
 .env
+.env.*
+!.env.template
 __pycache__/
 *.pyc
 .venv/
-.wallet.json
+*.json.tmp
 .pytest_cache/
 *.tmp
-/wallet_state.json
-/journal.json
+wallet_state.json
+journal.json
+wallet.json

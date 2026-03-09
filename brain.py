@@ -1,11 +1,13 @@
-"""Marco's brain — Claude-powered decision engine with personality."""
+"""Marco's brain — Claude-powered decision engine with personality.
+
+Uses Claude Code CLI (subscription-based) instead of API credits.
+"""
 
 import asyncio
 import json
 import os
 import re
-
-import anthropic
+import tempfile
 
 SYSTEM_PROMPT = """You are Marco, an autonomous cross-chain yield nomad.
 
@@ -70,17 +72,39 @@ Respond with:
 If yields are stable and no migration makes sense, action should be "hold" with empty moves.
 Always end your response with the JSON block wrapped in ```json``` fences."""
 
-MODEL = os.getenv("BRAIN_MODEL", "claude-sonnet-4-20250514")
-
-# Reuse a single client across cycles (connection pooling, no per-call overhead)
-_client: anthropic.AsyncAnthropic | None = None
+CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH", os.path.expanduser("~/.local/bin/claude"))
 
 
-def _get_client() -> anthropic.AsyncAnthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.AsyncAnthropic()
-    return _client
+async def _call_claude_cli(prompt: str, system: str) -> str:
+    """Call Claude Code CLI with a prompt. Uses subscription auth, not API credits."""
+    # Write prompt to temp file to avoid shell escaping issues
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        # Combine system + user prompt since CLI doesn't have a system param
+        full_prompt = f"{system}\n\n---\n\n{prompt}"
+        f.write(full_prompt)
+        prompt_file = f.name
+
+    try:
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)  # Allow nested invocation
+
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                CLAUDE_CLI, "-p", full_prompt,
+                "--output-format", "text",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            ),
+            timeout=90,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        text = stdout.decode().strip()
+        if proc.returncode != 0 and not text:
+            raise RuntimeError(f"claude CLI exited {proc.returncode}: {stderr.decode()[:200]}")
+        return text
+    finally:
+        os.unlink(prompt_file)
 
 
 async def decide(
@@ -102,8 +126,6 @@ async def decide(
     Returns:
         {"journal": str, "decision": dict}
     """
-    client = _get_client()
-
     # Build the context message
     context_parts = []
     context_parts.append("## Current Portfolio")
@@ -168,21 +190,12 @@ async def decide(
     message = "\n".join(context_parts)
 
     try:
-        response = await asyncio.wait_for(
-            client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": message}],
-            ),
-            timeout=45,  # Hard cutoff — don't block the cycle for a slow API
-        )
-        text = response.content[0].text
+        text = await _call_claude_cli(message, SYSTEM_PROMPT)
     except Exception as e:
-        # Return safe default on API failure — don't crash the cycle
+        # Return safe default on CLI failure — don't crash the cycle
         return {
-            "journal": f"Brain offline — API error: {e}. Holding by default.",
-            "decision": {"action": "hold", "moves": [], "confidence": 0.0, "risk_notes": f"API error: {e}"},
+            "journal": f"Brain offline — CLI error: {e}. Holding by default.",
+            "decision": {"action": "hold", "moves": [], "confidence": 0.0, "risk_notes": f"CLI error: {e}"},
         }
 
     # Parse journal and decision
