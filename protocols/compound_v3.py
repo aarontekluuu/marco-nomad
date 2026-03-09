@@ -15,7 +15,7 @@ from protocols import PoolAdapter, DepositResult, WithdrawResult, register
 # Source: https://docs.compound.finance/#networks
 COMET_ADDRESSES = {
     8453: "0xb125E6687d4313864e53df431d5425969c15Eb2F",   # Base cUSDCv3
-    42161: "0xA5EDBDD9646f8dFF606d7448e414884C7d905dCA",  # Arbitrum cUSDCv3
+    42161: "0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf",  # Arbitrum cUSDCv3
     10: "0x2e44e174f7D53F0212823acC11C01A11d58c5bCB",     # Optimism cUSDCv3
     137: "0xF25212E676D1F7F89Cd72fFEe66158f541246445",    # Polygon cUSDCv3
 }

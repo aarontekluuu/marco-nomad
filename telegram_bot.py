@@ -1026,6 +1026,28 @@ class MarcoBot:
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling()
+        # Register command menu for Telegram autocomplete
+        try:
+            from telegram import BotCommand
+            await self.app.bot.set_my_commands([
+                BotCommand("status", "Current position and APY"),
+                BotCommand("portfolio", "Detailed portfolio view"),
+                BotCommand("scan", "Live yield scan"),
+                BotCommand("journal", "Recent journal entries"),
+                BotCommand("pnl", "Profit/loss summary"),
+                BotCommand("balances", "Multi-chain USDC balances"),
+                BotCommand("strategy", "View/change strategy profile"),
+                BotCommand("quote", "Get bridge/swap quote"),
+                BotCommand("limits", "View active limit orders"),
+                BotCommand("dca", "DCA mode status/control"),
+                BotCommand("withdraw", "Withdraw to owner address"),
+                BotCommand("withdraw_pool", "Emergency exit from yield pool"),
+                BotCommand("pause", "Pause agent"),
+                BotCommand("resume", "Resume agent"),
+                BotCommand("kill", "Emergency kill switch"),
+            ])
+        except Exception:
+            pass  # Non-critical — menu is convenience only
 
     async def stop(self):
         """Stop the bot."""
