@@ -26,9 +26,9 @@ DeFi yield is fragmented across dozens of chains. A USDC pool paying 28% on Base
 Marco is a **cross-chain yield nomad**. Every cycle, he:
 
 1. **Scans** — Pulls live yield data from DefiLlama across Base, Arbitrum, Optimism, Polygon
-2. **Quotes** — Gets real bridge costs from LI.FI to see if moving is worth it
-3. **Thinks** — Claude evaluates the spread vs. bridge cost with Marco's personality
-4. **Moves** — Executes the migration (or holds, if the math doesn't work)
+2. **Quotes** — Gets real bridge + swap costs from LI.FI to see if moving is worth it
+3. **Thinks** — Claude evaluates the spread vs. cost with Marco's personality
+4. **Moves** — Executes via LI.FI: cross-chain bridges, same-chain swaps (USDC↔DAI/USDT), or free rebalances
 5. **Journals** — Logs every decision in first-person, like a nomad's travel diary
 
 > *"Woke up to a shakeup. Optimism Velodrome compressed to 14.62%. Meanwhile Base is on fire — Merkl USDC surging at 28.47% with a 30-day average of 23.51%. LI.FI quote for moving back to Base: $0.18 via eco bridge, 4 seconds. On a 13.85% spread, that bridge cost pays for itself in under 2 hours. The math is screaming. Pulling back to Base."*
@@ -164,6 +164,12 @@ Marco is built for real money, not just demos:
 - **ChainId normalization** — hex chainId from API responses parsed to int before diamond validation (prevents bypass via type confusion)
 - **Concurrent cycle lock** — asyncio lock prevents overlapping cycles from Telegram triggers racing with scheduled runs
 - **Same-chain cost awareness** — pools on the current chain marked with zero bridge cost so brain can evaluate free rebalancing
+- **Private key validation** — format check + address derivation at startup, prevents signing from wrong wallet
+- **Address mismatch detection** — verifies private key derives the configured wallet address before every TX
+- **Telegram auth** — chat ID allowlist, unauthorized access attempts logged and rejected silently
+- **HTML escaping** — all Telegram output goes through `html.escape` (prevents markup/injection attacks)
+- **Rate-limited /migrate** — 5-minute cooldown prevents agent loop DoS via Telegram
+- **No prompt injection surface** — non-command text silently ignored, no freeform input to AI
 
 ## Quick Start
 
@@ -237,7 +243,7 @@ marco-nomad/
 ├── main.py            # Alternative entry with Telegram bot integration
 ├── demo/              # Seed data for dashboard (works without API keys)
 ├── tests/
-│   └── test_core.py   # 68 tests: bridge cost, yield filter, brain parsing, wallet, security
+│   └── test_core.py   # 89 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```

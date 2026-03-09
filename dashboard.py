@@ -238,7 +238,48 @@ with right:
 
     st.markdown("### 🔑 Wallet")
     addr = state.get("address", "—")
+    token = state.get("current_token", "USDC")
     st.code(addr, language=None)
+    st.caption(f"Holding: **{token}**")
+
+# ---------------------------------------------------------------------------
+# Migration Timeline Chart
+# ---------------------------------------------------------------------------
+
+if len(migrations) >= 2:
+    st.divider()
+    st.markdown("### 📈 Migration Timeline")
+
+    timeline_data = []
+    running_position = 100.0  # Starting position
+    for m in migrations:
+        cost = m.get("cost_usd", 0)
+        apy = m.get("pool_apy", 0)
+        running_position -= cost
+        to_name = CHAIN_NAMES.get(m.get("to_chain", 0), "?")
+        move_type = m.get("type", "bridge")
+        timeline_data.append({
+            "Time": m.get("timestamp", "")[:16].replace("T", " "),
+            "Position ($)": round(running_position, 2),
+            "APY (%)": apy,
+            "Chain": to_name,
+            "Type": move_type.title(),
+            "Cost ($)": cost,
+        })
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        st.markdown("**Position Over Time**")
+        st.line_chart(
+            data={d["Time"]: d["Position ($)"] for d in timeline_data},
+            height=200,
+        )
+    with chart_col2:
+        st.markdown("**APY at Each Move**")
+        st.bar_chart(
+            data={d["Time"]: d["APY (%)"] for d in timeline_data},
+            height=200,
+        )
 
 # ---------------------------------------------------------------------------
 # Live Yield Scanner
@@ -284,6 +325,6 @@ else:
 st.divider()
 st.caption(
     "Built for the [LI.FI Vibeathon](https://li.fi) · "
-    "Marco uses **LI.FI** for cross-chain bridge quotes and execution, "
+    "Marco uses **LI.FI** for cross-chain bridges + same-chain swaps, "
     "**DefiLlama** for yield data, and **Claude** for decision-making."
 )
