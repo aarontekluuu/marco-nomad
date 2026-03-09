@@ -101,15 +101,18 @@ def filter_pools(
             # Extra guard: DefiLlama's stablecoin flag can be unreliable for LP pairs.
             # Skip pools whose symbol contains known volatile tokens mixed with stables.
             symbol = (p.get("symbol") or "").upper()
+            # Only surface tokens Marco can actually hold (USD-pegged stablecoins)
+            _HOLDABLE_TOKENS = {"USDC", "USDT", "DAI", "FRAX", "LUSD", "GUSD", "BUSD",
+                                "USDC.E", "USDT.E", "USDBC", "PYUSD", "CRVUSD", "GHO"}
             if "-" in symbol or "/" in symbol:
-                # LP pair — check both sides are stablecoins
-                _STABLE_TOKENS = {"USDC", "USDT", "DAI", "FRAX", "LUSD", "GUSD", "BUSD",
-                                  "USDC.E", "USDT.E", "USDBC", "USDA", "USDE", "SUSD",
-                                  "CUSD", "DOLA", "MIM", "TUSD", "PYUSD", "CRVUSD", "GHO",
-                                  "MSUSD", "SUSDCE"}
+                # LP pair — check both sides are holdable stablecoins
                 parts = [t.strip() for t in symbol.replace("/", "-").split("-")]
-                if not all(t in _STABLE_TOKENS for t in parts if t):
-                    continue  # Has a volatile component — skip
+                if not all(t in _HOLDABLE_TOKENS for t in parts if t):
+                    continue  # Has exotic/non-USD or volatile component — skip
+            else:
+                # Single token — must be holdable
+                if symbol not in _HOLDABLE_TOKENS:
+                    continue  # Exotic stable (EURC, FXUSD, YOUSD) — skip
         if exclude_outliers and p.get("outlier"):
             continue
         if no_il_risk and p.get("ilRisk") == "yes":
@@ -121,6 +124,9 @@ def filter_pools(
         # Detect suspicious APY spikes: current >> 30-day average
         mean30d = p.get("apyMean30d") or 0
         p["_apy_spike"] = mean30d > 0 and apy / mean30d > MAX_APY_SPIKE_RATIO
+
+        # Detect yield collapse: current << 30-day average (dying pool)
+        p["_apy_collapse"] = mean30d > 0 and apy < mean30d * 0.3  # Current < 30% of 30d avg
 
         # Mark protocol trust level
         project = (p.get("project") or "").lower()
@@ -141,6 +147,8 @@ def filter_pools(
             base *= 1.15  # Mild boost — enough to break ties, not dominate
         if x.get("_apy_spike"):
             base *= 0.5  # Penalize spikes in ranking
+        if x.get("_apy_collapse"):
+            base *= 0.3  # Heavily penalize collapsing yields
         return -base
 
     filtered.sort(key=_sort_key)

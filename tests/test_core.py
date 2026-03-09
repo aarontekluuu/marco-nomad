@@ -110,18 +110,14 @@ class TestBrainJsonExtraction:
 # ---------------------------------------------------------------------------
 
 class TestBrainErrorHandling:
-    """Test that brain.decide() gracefully handles API failures."""
+    """Test that brain.decide() gracefully handles CLI failures."""
 
     @pytest.mark.asyncio
-    async def test_api_error_returns_hold(self):
-        """API failure should return hold with confidence 0, not crash."""
-        from unittest.mock import AsyncMock, patch, MagicMock
+    async def test_cli_error_returns_hold(self):
+        """CLI failure should return hold with confidence 0, not crash."""
+        from unittest.mock import AsyncMock, patch
 
-        mock_client = MagicMock()
-        mock_client.messages = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=Exception("rate limited"))
-
-        with patch("brain._get_client", return_value=mock_client):
+        with patch("brain._call_claude_cli", new_callable=AsyncMock, side_effect=Exception("CLI crashed")):
             import brain
             result = await brain.decide(
                 {"Base": {"usdc": 100}},
@@ -129,7 +125,7 @@ class TestBrainErrorHandling:
             )
         assert result["decision"]["action"] == "hold"
         assert result["decision"]["confidence"] == 0.0
-        assert "API error" in result["journal"]
+        assert "CLI error" in result["journal"]
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +400,7 @@ from wallet import (
 class TestCanMigrate:
 
     def test_sufficient_balance(self):
-        state = {"position_usd": 100.0, "migrations": []}
+        state = {"position_usd": 25.0, "migrations": []}
         ok, reason = can_migrate(state, cost_usd=1.0)
         assert ok is True
         assert reason == "ok"
@@ -431,7 +427,7 @@ class TestCanMigrate:
     def test_cooldown_blocks(self):
         recent = datetime.now() - timedelta(hours=1)
         state = {
-            "position_usd": 100.0,
+            "position_usd": 25.0,
             "migrations": [{"timestamp": recent.isoformat()}],
         }
         ok, reason = can_migrate(state, cost_usd=0.50)
@@ -441,7 +437,7 @@ class TestCanMigrate:
     def test_cooldown_expired(self):
         old = datetime.now() - timedelta(hours=MIN_MIGRATION_INTERVAL_HOURS + 1)
         state = {
-            "position_usd": 100.0,
+            "position_usd": 25.0,
             "migrations": [{"timestamp": old.isoformat()}],
         }
         ok, _ = can_migrate(state, cost_usd=0.50)
@@ -455,7 +451,7 @@ class TestCanMigrate:
     def test_malformed_timestamp_blocks_migration(self):
         """Fail-closed: corrupt timestamp should block migration, not silently pass."""
         state = {
-            "position_usd": 100.0,
+            "position_usd": 25.0,
             "migrations": [{"timestamp": "not-a-date"}],
         }
         ok, reason = can_migrate(state, cost_usd=0.50)
@@ -581,7 +577,7 @@ class TestStablecoinSwaps:
         from wallet import STATE_FILE
         state = {
             "address": "", "current_chain": 8453, "current_token": "USDC",
-            "current_pool": None, "position_usd": 100.0, "migrations": [],
+            "current_pool": None, "position_usd": 25.0, "migrations": [],
         }
         pool = {"symbol": "DAI", "project": "aave-v3", "chain": "Base", "apy": 5.0}
         # Temporarily redirect state file to avoid overwriting real state
@@ -605,7 +601,7 @@ class TestStablecoinSwaps:
         from wallet import STATE_FILE
         state = {
             "address": "", "current_chain": 8453, "current_token": "USDC",
-            "current_pool": None, "position_usd": 100.0, "migrations": [],
+            "current_pool": None, "position_usd": 25.0, "migrations": [],
         }
         pool = {"symbol": "USDC", "project": "aave-v3", "chain": "Optimism", "apy": 5.0}
         original = STATE_FILE
@@ -659,7 +655,7 @@ class TestSaveStateAndRoundTrip:
     def test_save_overwrites_previous(self, tmp_path):
         state_file = tmp_path / "wallet_state.json"
         with patch("wallet.STATE_FILE", state_file):
-            save_state({"position_usd": 100.0, "v": 1})
+            save_state({"position_usd": 25.0, "v": 1})
             save_state({"position_usd": 50.0, "v": 2})
             loaded = load_state()
         assert loaded["v"] == 2
@@ -678,7 +674,7 @@ class TestMigrationsCap:
 
     def test_cap_at_max_migrations(self, tmp_path):
         state_file = tmp_path / "wallet_state.json"
-        state = {"position_usd": 100.0, "migrations": [], "current_chain": 8453}
+        state = {"position_usd": 25.0, "migrations": [], "current_chain": 8453}
         # Add MAX_MIGRATIONS + 10 entries
         for i in range(MAX_MIGRATIONS + 10):
             state["migrations"].append({"timestamp": f"2026-01-01T{i:05d}", "from_chain": 8453, "to_chain": 42161})
@@ -689,7 +685,7 @@ class TestMigrationsCap:
 
     def test_keeps_most_recent_migrations(self, tmp_path):
         state_file = tmp_path / "wallet_state.json"
-        state = {"position_usd": 100.0, "migrations": [], "current_chain": 8453}
+        state = {"position_usd": 25.0, "migrations": [], "current_chain": 8453}
         for i in range(MAX_MIGRATIONS + 5):
             state["migrations"].append({"timestamp": f"entry-{i}", "from_chain": 8453, "to_chain": 42161})
         pool = {"symbol": "USDC", "project": "aave-v3", "chain": "Base", "apy": 5.0, "pool": "abc"}
@@ -923,10 +919,10 @@ class TestSecurityHardening:
             "address": "0x1234",
             "current_chain": 8453,
             "current_token": "USDC",
-            "position_usd": 100.0,
+            "position_usd": 25.0,
             "migrations": [],
         }
-        # Simulate a 50% drift — should NOT auto-correct
+        # Simulate a 100% drift — should NOT auto-correct
         original = w.STATE_FILE
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
@@ -934,17 +930,17 @@ class TestSecurityHardening:
             tmp.close()
             w.STATE_FILE = Path(tmp.name)
 
-            # Mock check_onchain_balance to return 50.0 (50% drift from 100.0)
+            # Mock check_onchain_balance to return 50.0 (100% drift from 25.0)
             from unittest.mock import patch
             with patch.object(w, "check_onchain_balance", return_value=50.0):
                 drift = w.reconcile_balance(state, "http://fake-rpc")
 
-            assert drift == -50.0
+            assert drift == 25.0
             # Position should NOT have been updated (drift too large)
-            assert state["position_usd"] == 100.0
+            assert state["position_usd"] == 25.0
             # Should have set a drift alert
             assert "_drift_alert" in state
-            assert state["_drift_alert"]["drift_pct"] == 50.0
+            assert state["_drift_alert"]["drift_pct"] == 100.0
         finally:
             w.STATE_FILE = original
             os.unlink(tmp.name)
@@ -957,7 +953,7 @@ class TestSecurityHardening:
             "address": "0x1234",
             "current_chain": 8453,
             "current_token": "USDC",
-            "position_usd": 100.0,
+            "position_usd": 25.0,
             "migrations": [],
         }
         original = w.STATE_FILE
@@ -968,12 +964,12 @@ class TestSecurityHardening:
             w.STATE_FILE = Path(tmp.name)
 
             from unittest.mock import patch
-            with patch.object(w, "check_onchain_balance", return_value=99.50):
+            with patch.object(w, "check_onchain_balance", return_value=25.50):
                 drift = w.reconcile_balance(state, "http://fake-rpc")
 
-            assert drift == -0.5
-            # Small drift — should have been auto-corrected
-            assert state["position_usd"] == 99.50
+            assert drift == 0.5
+            # Small drift (2%) — should have been auto-corrected
+            assert state["position_usd"] == 25.50
         finally:
             w.STATE_FILE = original
             os.unlink(tmp.name)
@@ -982,7 +978,7 @@ class TestSecurityHardening:
         """Invalid migration timestamp should block migration (fail-closed)."""
         import wallet as w
         state = {
-            "position_usd": 100.0,
+            "position_usd": 25.0,
             "migrations": [{"timestamp": "not-a-date", "cost_usd": 0.1}],
         }
         allowed, reason = w.can_migrate(state, 0.5)
@@ -1109,12 +1105,13 @@ class TestWalletBootstrap:
             tmp_dir = Path(tempfile.mkdtemp())
             w.WALLET_DIR = tmp_dir
             w.WALLET_FILE = tmp_dir / "wallet.json"
-            # Use a valid-format key (may not derive without eth_account)
+            # Use a valid-format key — eth_account normalizes to 0x-prefixed
             test_key = "a" * 64
             with patch.dict(os.environ, {"WALLET_PRIVATE_KEY": test_key}, clear=False):
                 result = w.load_wallet()
-                if result:
-                    assert result[1] == test_key
+                assert result is not None
+                # Address should be derived, key may be normalized with 0x prefix
+                assert result[0]  # Non-empty address
         finally:
             w.WALLET_DIR = original_dir
             w.WALLET_FILE = original_file

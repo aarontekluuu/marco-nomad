@@ -15,6 +15,8 @@ WALLET_FILE = WALLET_DIR / "wallet.json"
 MIN_POSITION_USD = 5.0  # Never migrate if position would drop below this
 MIN_MIGRATION_INTERVAL_HOURS = 4  # Cooldown between migrations to prevent thrashing
 MAX_MIGRATIONS = 200  # Cap migration history to prevent wallet_state.json bloat
+MAX_TX_VALUE_USD = 50.0  # SAFETY: Hard cap on single TX value — prevents draining wallet
+MAX_DAILY_BRIDGE_COST_USD = 5.0  # SAFETY: Max cumulative bridge costs per 24h
 
 # Well-known USDC addresses per chain (must match yield_scanner.CHAIN_MAP)
 USDC = {
@@ -228,10 +230,21 @@ def save_state(state: dict):
 
 
 def can_migrate(state: dict, cost_usd: float) -> tuple[bool, str]:
-    """Check if migration is safe. Returns (allowed, reason)."""
+    """Check if migration is safe. Returns (allowed, reason).
+
+    Safety gates (all fail-closed):
+    1. Minimum position after cost deduction
+    2. Migration cooldown (prevent thrashing)
+    3. Single TX value cap (prevent draining)
+    4. Daily bridge cost cap (prevent fee bleed)
+    """
     position = state.get("position_usd", 0)
     if position - cost_usd < MIN_POSITION_USD:
         return False, f"Position ${position:.2f} - bridge ${cost_usd:.2f} = ${position - cost_usd:.2f} < min ${MIN_POSITION_USD}"
+
+    # SAFETY: Hard cap on single TX value
+    if position > MAX_TX_VALUE_USD:
+        return False, f"Position ${position:.2f} exceeds max TX value ${MAX_TX_VALUE_USD}. Increase MAX_TX_VALUE_USD to proceed."
 
     migrations = state.get("migrations", [])
     if migrations:
@@ -244,6 +257,19 @@ def can_migrate(state: dict, cost_usd: float) -> tuple[bool, str]:
         except (ValueError, TypeError):
             # Fail-closed: if timestamp is corrupt, enforce cooldown to prevent rapid migrations
             return False, "Cooldown: last migration timestamp is invalid — blocking until next cycle"
+
+        # SAFETY: Daily bridge cost cap — sum costs from last 24h
+        now = datetime.now()
+        daily_cost = 0.0
+        for m in migrations:
+            try:
+                m_dt = datetime.fromisoformat(m.get("timestamp", ""))
+                if (now - m_dt).total_seconds() < 86400:
+                    daily_cost += m.get("cost_usd", 0)
+            except (ValueError, TypeError):
+                continue
+        if daily_cost + cost_usd > MAX_DAILY_BRIDGE_COST_USD:
+            return False, f"Daily cost cap: ${daily_cost:.2f} spent + ${cost_usd:.2f} = ${daily_cost + cost_usd:.2f} > ${MAX_DAILY_BRIDGE_COST_USD} limit"
 
     return True, "ok"
 

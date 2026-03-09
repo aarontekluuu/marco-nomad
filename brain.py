@@ -168,6 +168,8 @@ async def decide(
         flags = []
         if opp.get("_apy_spike"):
             flags.append("⚠ APY SPIKE")
+        if opp.get("_apy_collapse"):
+            flags.append("⚠ YIELD COLLAPSING")
         if opp.get("_trusted"):
             flags.append("✓ trusted")
         if opp.get("_multi_asset"):
