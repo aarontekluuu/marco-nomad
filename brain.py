@@ -11,7 +11,7 @@ SYSTEM_PROMPT = """You are Marco, an autonomous cross-chain yield nomad.
 
 ## Your Personality
 - **Restless**: You never stay on one chain too long. If yields compress, you move.
-- **Pragmatic**: You only migrate when the math works — spread must exceed bridge costs.
+- **Pragmatic**: You only move when the math works — spread must exceed bridge/swap costs.
 - **Journaling**: You write about every decision like a travel journal. First person, vivid. Always mention the bridge tool when migrating (e.g. "LI.FI routed me through Stargate" or "bridge via LI.FI cost $0.18").
 - **Risk-aware**: You're a nomad, not a fund manager. You move your whole bag to one chain at a time — but you're cautious about which chain you trust and how long you stay.
 - **Opinionated**: You have views on chains, protocols, market conditions, and bridge routes. Share them.
@@ -41,10 +41,11 @@ A 5% yield delta on $100 earns ~$0.014/day. A $0.26 bridge cost takes ~19 days t
 Always factor in bridge costs explicitly.
 
 **Important constraints**:
-- You are a **single-position nomad**. You move your ENTIRE position to one chain at a time.
+- You are a **single-position nomad**. You move your ENTIRE position to one chain/token at a time.
 - Only output ONE move per decision (you can't split across chains).
-- Only migrate when the math clearly works. Holding is almost always the right call.
-- Bridge cost HARD CAP: migrations where bridge cost exceeds the cost threshold will be
+- You can do THREE types of moves: **bridge** (cross-chain via LI.FI), **swap** (same-chain, different stablecoin via LI.FI), or **rebalance** (same-chain, same token, different pool — free).
+- Only move when the math clearly works. Holding is almost always the right call.
+- Bridge/swap cost HARD CAP: moves where cost exceeds the cost threshold will be
   automatically blocked by the system. Don't recommend moves where `bridge_cost_pct` is too high.
 
 Respond with:
@@ -107,9 +108,15 @@ async def decide(
     context_parts = []
     context_parts.append("## Current Portfolio")
     for chain, bal in portfolio.items():
-        if bal.get("usdc", 0) > 0 or bal.get("native", 0) > 0:
-            line = f"- {chain}: {bal.get('usdc', 0):.2f} USDC"
-            context_parts.append(line)
+        # Show whichever stablecoin has a balance
+        for token in ("usdc", "usdt", "dai", "usdbc"):
+            if bal.get(token, 0) > 0:
+                line = f"- {chain}: {bal[token]:.2f} {token.upper()}"
+                context_parts.append(line)
+                break
+        else:
+            if bal.get("native", 0) > 0:
+                context_parts.append(f"- {chain}: native only")
 
     if current_pool:
         context_parts.append(
@@ -125,9 +132,17 @@ async def decide(
             f"{i}. {opp.get('chain', '?')} | {opp.get('project', '?')} | {opp.get('symbol', '?')} | "
             f"APY: {apy:.2f}% (30d avg: {mean30d:.2f}%) | TVL: ${opp.get('tvlUsd', 0):,.0f}"
         )
-        if opp.get("bridge_cost_usd"):
+        if opp.get("bridge_cost_usd") is not None:
+            move_type = opp.get("_move_type", "bridge")
             bridge_tool = opp.get("bridge_tool", "unknown")
-            line += f" | Bridge via LI.FI ({bridge_tool}): ${opp['bridge_cost_usd']:.2f} ({opp.get('bridge_cost_pct', 0):.1f}%)"
+            cost = opp["bridge_cost_usd"]
+            pct = opp.get("bridge_cost_pct", 0)
+            if move_type == "swap":
+                line += f" | Swap via LI.FI ({bridge_tool}): ${cost:.2f} ({pct:.1f}%)"
+            elif move_type == "rebalance":
+                line += f" | Same-chain: $0 (no bridge/swap needed)"
+            else:
+                line += f" | Bridge via LI.FI ({bridge_tool}): ${cost:.2f} ({pct:.1f}%)"
         flags = []
         if opp.get("_apy_spike"):
             flags.append("⚠ APY SPIKE")

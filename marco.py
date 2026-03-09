@@ -127,41 +127,71 @@ async def _run_cycle_inner():
         for p in candidates[:5]:
             log(f"  {yield_scanner.format_pool(p)}")
 
-        # 2. Get bridge costs for cross-chain moves
-        log("Getting bridge quotes...")
+        # 2. Get bridge/swap quotes for all potential moves
+        log("Getting bridge + swap quotes...")
         wallet_addr = state.get("address") or "0x0000000000000000000000000000000000000001"
         current_chain = state["current_chain"]
+        current_token = state.get("current_token", "USDC")
         position_usd = state.get("position_usd", POSITION_SIZE)
 
-        bridge_quotes = {}  # chain_name -> {cost, quote, cost_pct}
+        bridge_quotes = {}  # quote_key -> {cost, quote, cost_pct, type}
 
-        # Build quote tasks for parallel execution
-        async def _fetch_quote(pool_chain_name, target_chain_id):
-            from_token = wallet.USDC.get(current_chain)
-            to_token = wallet.USDC.get(target_chain_id)
-            if not from_token or not to_token:
-                return
-            amount_wei = str(int(position_usd * 10**wallet.USDC_DECIMALS))
+        # Resolve current token address + decimals
+        current_stable = wallet.STABLECOINS.get((current_chain, current_token))
+        current_token_addr = current_stable["address"] if current_stable else wallet.USDC.get(current_chain)
+        current_token_decimals = current_stable["decimals"] if current_stable else wallet.USDC_DECIMALS
+
+        async def _fetch_quote(quote_key, from_chain, to_chain, from_token, to_token, from_decimals, move_type):
+            amount_wei = str(int(position_usd * 10**from_decimals))
             try:
                 quote = await lifi.get_quote(
-                    client, current_chain, target_chain_id, from_token, to_token,
+                    client, from_chain, to_chain, from_token, to_token,
                     amount_wei, wallet_addr, slippage=SLIPPAGE, api_key=LIFI_API_KEY,
                 )
                 cost = lifi.calc_bridge_cost(quote)
                 cost_pct = (cost["total_cost_usd"] / position_usd * 100) if position_usd > 0 else 0
-                bridge_quotes[pool_chain_name] = {"cost": cost, "quote": quote, "cost_pct": cost_pct}
+                bridge_quotes[quote_key] = {
+                    "cost": cost, "quote": quote, "cost_pct": cost_pct, "type": move_type,
+                }
             except Exception as e:
-                log(f"  -> {pool_chain_name}: quote failed ({e})")
+                log(f"  -> {quote_key}: quote failed ({e})")
 
-        # Fetch all quotes in parallel
+        # Build quote tasks — bridges (cross-chain) + swaps (same-chain, different token)
         quote_tasks = []
-        seen_chains = set()
+        seen_bridges = set()  # chain IDs we've already quoted
+        seen_swaps = set()    # (chain_id, token_symbol) pairs we've already quoted
+
         for pool in candidates[:10]:
-            target_chain = CHAIN_MAP_REVERSE.get(pool.get("chain"))
-            if not target_chain or target_chain == current_chain or target_chain in seen_chains:
+            pool_chain_name = pool.get("chain", "")
+            target_chain = CHAIN_MAP_REVERSE.get(pool_chain_name)
+            if not target_chain:
                 continue
-            seen_chains.add(target_chain)
-            quote_tasks.append(_fetch_quote(pool["chain"], target_chain))
+
+            pool_token = wallet._infer_pool_token(pool)
+
+            if target_chain != current_chain:
+                # Cross-chain bridge: current token → USDC on target (always land in USDC)
+                if target_chain not in seen_bridges:
+                    seen_bridges.add(target_chain)
+                    to_token = wallet.USDC.get(target_chain)
+                    if current_token_addr and to_token:
+                        quote_tasks.append(_fetch_quote(
+                            pool_chain_name, current_chain, target_chain,
+                            current_token_addr, to_token, current_token_decimals, "bridge",
+                        ))
+            elif pool_token != current_token:
+                # Same-chain swap: current token → pool's token via LI.FI
+                swap_key = (target_chain, pool_token)
+                if swap_key not in seen_swaps:
+                    seen_swaps.add(swap_key)
+                    target_stable = wallet.STABLECOINS.get((target_chain, pool_token))
+                    if current_token_addr and target_stable:
+                        quote_key = f"{pool_chain_name} swap {current_token}→{pool_token}"
+                        quote_tasks.append(_fetch_quote(
+                            quote_key, current_chain, current_chain,
+                            current_token_addr, target_stable["address"],
+                            current_token_decimals, "swap",
+                        ))
 
         if quote_tasks:
             await asyncio.gather(*quote_tasks)
@@ -201,23 +231,37 @@ async def _run_cycle_inner():
                 current_pool["apy"] = new_apy
                 state["current_pool"] = current_pool
 
-        # 4. Enrich candidates with bridge cost data for brain
+        # 4. Enrich candidates with bridge/swap cost data for brain
         current_chain_name = CHAIN_MAP.get(current_chain, "")
         for pool in candidates:
             chain_name = pool.get("chain", "")
-            if chain_name == current_chain_name:
-                # Same-chain move — no bridge needed, zero cost
+            pool_token = wallet._infer_pool_token(pool)
+
+            if chain_name == current_chain_name and pool_token == current_token:
+                # Same-chain, same token — no move needed, zero cost
                 pool["bridge_cost_usd"] = 0.0
                 pool["bridge_cost_pct"] = 0.0
                 pool["bridge_tool"] = "same-chain (no bridge)"
+                pool["_move_type"] = "rebalance"
+            elif chain_name == current_chain_name and pool_token != current_token:
+                # Same-chain swap via LI.FI
+                swap_key = f"{chain_name} swap {current_token}→{pool_token}"
+                if swap_key in bridge_quotes:
+                    pool["bridge_cost_usd"] = bridge_quotes[swap_key]["cost"]["total_cost_usd"]
+                    pool["bridge_cost_pct"] = bridge_quotes[swap_key]["cost_pct"]
+                    pool["bridge_tool"] = bridge_quotes[swap_key]["cost"]["bridge"]
+                    pool["_move_type"] = "swap"
+                else:
+                    pool["_move_type"] = "swap"
             elif chain_name in bridge_quotes:
                 pool["bridge_cost_usd"] = bridge_quotes[chain_name]["cost"]["total_cost_usd"]
                 pool["bridge_cost_pct"] = bridge_quotes[chain_name]["cost_pct"]
                 pool["bridge_tool"] = bridge_quotes[chain_name]["cost"]["bridge"]
+                pool["_move_type"] = "bridge"
 
         # 5. Build portfolio view using actual position size
         chain_name = CHAIN_MAP.get(current_chain, f"Chain {current_chain}")
-        portfolio = {chain_name: {"usdc": position_usd, "native": 0}}
+        portfolio = {chain_name: {current_token.lower(): position_usd, "native": 0}}
 
         # 6. Ask Marco's brain
         log("Marco is thinking...")

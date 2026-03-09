@@ -394,7 +394,11 @@ class TestFilterPools:
 # wallet.py — can_migrate, save_state, state round-trip
 # ---------------------------------------------------------------------------
 
-from wallet import can_migrate, save_state, load_state, record_migration, MIN_POSITION_USD, MIN_MIGRATION_INTERVAL_HOURS, MAX_MIGRATIONS
+from wallet import (
+    can_migrate, save_state, load_state, record_migration,
+    MIN_POSITION_USD, MIN_MIGRATION_INTERVAL_HOURS, MAX_MIGRATIONS,
+    _infer_pool_token, STABLECOINS, ALLOWED_STABLES,
+)
 
 
 class TestCanMigrate:
@@ -466,6 +470,80 @@ class TestCanMigrate:
         state = {"position_usd": 10.0, "migrations": []}
         ok, _ = can_migrate(state, cost_usd=0.0)
         assert ok is True
+
+
+class TestStablecoinSwaps:
+    """Test stablecoin swap infrastructure."""
+
+    def test_infer_pool_token_single(self):
+        assert _infer_pool_token({"symbol": "USDC"}) == "USDC"
+        assert _infer_pool_token({"symbol": "DAI"}) == "DAI"
+        assert _infer_pool_token({"symbol": "USDT"}) == "USDT"
+
+    def test_infer_pool_token_lp_pair(self):
+        assert _infer_pool_token({"symbol": "USDC-DAI"}) == "USDC"
+        assert _infer_pool_token({"symbol": "DAI-USDC"}) == "DAI"
+
+    def test_infer_pool_token_unknown_defaults_usdc(self):
+        assert _infer_pool_token({"symbol": "WETH"}) == "USDC"
+        assert _infer_pool_token({}) == "USDC"
+
+    def test_stablecoins_registry_has_major_chains(self):
+        """STABLECOINS should cover Base, Arbitrum, Optimism for USDC at minimum."""
+        for chain_id in (8453, 42161, 10):
+            assert (chain_id, "USDC") in STABLECOINS, f"Missing USDC on chain {chain_id}"
+
+    def test_stablecoins_addresses_are_checksummed(self):
+        """All addresses in STABLECOINS should be valid hex."""
+        for key, info in STABLECOINS.items():
+            addr = info["address"]
+            assert addr.startswith("0x"), f"Bad address for {key}: {addr}"
+            assert len(addr) == 42, f"Wrong length for {key}: {addr}"
+
+    def test_record_migration_tracks_token(self):
+        """record_migration should set current_token in state."""
+        import tempfile, os
+        from wallet import STATE_FILE
+        state = {
+            "address": "", "current_chain": 8453, "current_token": "USDC",
+            "current_pool": None, "position_usd": 100.0, "migrations": [],
+        }
+        pool = {"symbol": "DAI", "project": "aave-v3", "chain": "Base", "apy": 5.0}
+        # Temporarily redirect state file to avoid overwriting real state
+        original = STATE_FILE
+        try:
+            import wallet
+            wallet.STATE_FILE = Path(tempfile.mktemp(suffix=".json"))
+            record_migration(state, 8453, 8453, pool, 0.02, "swap test", to_token="DAI")
+            assert state["current_token"] == "DAI"
+            assert state["migrations"][-1]["type"] == "swap"
+            assert state["migrations"][-1]["from_token"] == "USDC"
+            assert state["migrations"][-1]["to_token"] == "DAI"
+        finally:
+            if wallet.STATE_FILE.exists():
+                wallet.STATE_FILE.unlink()
+            wallet.STATE_FILE = original
+
+    def test_record_migration_bridge_type(self):
+        """Cross-chain move should record type='bridge'."""
+        import tempfile
+        from wallet import STATE_FILE
+        state = {
+            "address": "", "current_chain": 8453, "current_token": "USDC",
+            "current_pool": None, "position_usd": 100.0, "migrations": [],
+        }
+        pool = {"symbol": "USDC", "project": "aave-v3", "chain": "Optimism", "apy": 5.0}
+        original = STATE_FILE
+        try:
+            import wallet
+            wallet.STATE_FILE = Path(tempfile.mktemp(suffix=".json"))
+            record_migration(state, 8453, 10, pool, 0.25, "bridge test")
+            assert state["migrations"][-1]["type"] == "bridge"
+            assert state["current_chain"] == 10
+        finally:
+            if wallet.STATE_FILE.exists():
+                wallet.STATE_FILE.unlink()
+            wallet.STATE_FILE = original
 
 
 class TestSaveStateAndRoundTrip:

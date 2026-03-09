@@ -90,11 +90,13 @@ CHAIN_NAMES = {
     1: "Ethereum", 8453: "Base", 42161: "Arbitrum",
     10: "Optimism", 137: "Polygon", 56: "BSC",
     43114: "Avalanche", 250: "Fantom",
+    324: "zkSync Era", 59144: "Linea", 534352: "Scroll",
 }
 CHAIN_EMOJI = {
     "Base": "🔵", "Optimism": "🔴", "Arbitrum": "🔷",
     "Polygon": "🟣", "Ethereum": "⬛", "BSC": "🟡",
     "Avalanche": "🔺", "Fantom": "👻",
+    "zkSync Era": "🔹", "Linea": "🔻", "Scroll": "📜",
 }
 
 
