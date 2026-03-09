@@ -418,9 +418,12 @@ async def _run_cycle_inner():
                     elif tx_result["status"] == "DONE":
                         dest_rpc = lifi.RPC_URLS.get(target_chain_id)
                         if dest_rpc:
+                            # Check balance of the token we're landing in
+                            dest_token = target_pool_token if is_swap else "USDC"
                             actual = await asyncio.to_thread(
                                 wallet.check_onchain_balance,
                                 target_chain_id, wallet_addr, dest_rpc,
+                                token=dest_token,
                             )
                             if actual is not None:
                                 expected_min = fresh_cost["to_amount_min"]
