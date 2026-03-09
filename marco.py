@@ -31,6 +31,7 @@ MAX_BRIDGE_COST_PCT = float(os.getenv("MAX_BRIDGE_COST_PCT", "2.0"))
 POSITION_SIZE = float(os.getenv("POSITION_SIZE_USD", "100"))
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", "3600"))
 LIFI_API_KEY = os.getenv("LIFI_API_KEY")
+SLIPPAGE = float(os.getenv("SLIPPAGE", "0.005"))  # 0.5% default — tight for stablecoins
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
@@ -131,7 +132,7 @@ async def run_cycle():
             try:
                 quote = await lifi.get_quote(
                     client, current_chain, target_chain_id, from_token, to_token,
-                    amount_wei, wallet_addr, api_key=LIFI_API_KEY,
+                    amount_wei, wallet_addr, slippage=SLIPPAGE, api_key=LIFI_API_KEY,
                 )
                 cost = lifi.calc_bridge_cost(quote)
                 cost_pct = (cost["total_cost_usd"] / position_usd * 100) if position_usd > 0 else 0
@@ -274,7 +275,7 @@ async def run_cycle():
                         fresh_quote = await lifi.get_quote(
                             client, current_chain, target_chain_id,
                             from_token, to_token, amount_wei, wallet_addr,
-                            api_key=LIFI_API_KEY,
+                            slippage=SLIPPAGE, api_key=LIFI_API_KEY,
                         )
                         fresh_cost = lifi.calc_bridge_cost(fresh_quote)
                         fresh_cost_pct = (fresh_cost["total_cost_usd"] / move_usd * 100) if move_usd > 0 else 0

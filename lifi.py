@@ -42,10 +42,10 @@ async def get_quote(
     to_token: str,
     from_amount: str,
     from_address: str,
-    slippage: float = 0.03,
+    slippage: float = 0.005,
     api_key: str | None = None,
 ) -> dict:
-    """Get a cross-chain swap/bridge quote."""
+    """Get a cross-chain swap/bridge quote. Slippage default 0.5% (stablecoin-safe)."""
     params = {
         "fromChain": from_chain,
         "toChain": to_chain,
