@@ -63,6 +63,9 @@ class MarcoBot:
         self.app.add_handler(CommandHandler("scan", self._cmd_scan))
         self.app.add_handler(CommandHandler("quote", self._cmd_quote))
         self.app.add_handler(CommandHandler("fund", self._cmd_fund))
+        self.app.add_handler(CommandHandler("wallet", self._cmd_wallet))
+        self.app.add_handler(CommandHandler("pause", self._cmd_pause))
+        self.app.add_handler(CommandHandler("resume", self._cmd_resume))
         self.app.add_handler(CommandHandler("help", self._cmd_start))
         # Catch-all: ignore non-command messages silently (no prompt injection surface)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._ignore))
@@ -100,8 +103,11 @@ class MarcoBot:
             "/journal — recent decisions\n"
             "/scan — live yield scanner\n"
             "/quote &lt;chain&gt; — bridge cost estimate\n"
+            "/wallet — create or view wallet\n"
             "/fund — deposit address + safety info\n"
             "/migrate — force evaluation cycle\n"
+            "/pause — pause the agent loop\n"
+            "/resume — resume the agent loop\n"
             "/help — this message",
             parse_mode="HTML",
         )
@@ -404,6 +410,77 @@ class MarcoBot:
             lines.append(f"<code>{_escape(usdc_addr)}</code>")
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cmd_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Create or display Marco's wallet."""
+        if await self._reject_unauthorized(update):
+            return
+        from wallet import load_wallet, create_wallet, load_state
+        from yield_scanner import CHAIN_MAP
+
+        wallet_info = load_wallet()
+        if wallet_info:
+            addr, _ = wallet_info
+            state = load_state()
+            chain = state.get("current_chain", 8453)
+            chain_name = CHAIN_MAP.get(chain, f"Chain {chain}")
+            lines = [
+                "🔑 <b>Marco's Wallet</b>\n",
+                f"<b>Address:</b>",
+                f"<code>{_escape(addr)}</code>\n",
+                f"<b>Chain:</b> {_escape(chain_name)}",
+                f"<b>Position:</b> ${state.get('position_usd', 0):.2f} {_escape(state.get('current_token', 'USDC'))}",
+                "",
+                "Send USDC to this address to fund Marco.",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        else:
+            await update.message.reply_text("🔑 Creating a new wallet for Marco...")
+            try:
+                addr, _ = create_wallet()
+                # Update state with new address
+                state = load_state()
+                state["address"] = addr
+                from wallet import save_state
+                save_state(state)
+                lines = [
+                    "🔑 <b>Wallet Created!</b>\n",
+                    f"<b>Address:</b>",
+                    f"<code>{_escape(addr)}</code>\n",
+                    "⚠️ <b>Next steps:</b>",
+                    "• Send USDC on Base to this address",
+                    "• Start with a small test amount",
+                    "• Use /fund to see full safety checklist",
+                ]
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            except Exception as e:
+                await update.message.reply_text(f"Wallet creation failed: {_escape(str(e))}")
+
+    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Pause the agent loop."""
+        if await self._reject_unauthorized(update):
+            return
+        if self.agent and "paused" in self.agent:
+            if self.agent["paused"]:
+                await update.message.reply_text("⏸️ Already paused.")
+                return
+            self.agent["paused"] = True
+            await update.message.reply_text("⏸️ Marco is paused. Use /resume to restart.")
+        else:
+            await update.message.reply_text("⚠️ Agent loop not connected.")
+
+    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Resume the agent loop."""
+        if await self._reject_unauthorized(update):
+            return
+        if self.agent and "paused" in self.agent:
+            if not self.agent["paused"]:
+                await update.message.reply_text("▶️ Already running.")
+                return
+            self.agent["paused"] = False
+            await update.message.reply_text("▶️ Marco is back! Next cycle will run on schedule.")
+        else:
+            await update.message.reply_text("⚠️ Agent loop not connected.")
 
     async def send_journal(self, entry: str):
         """Post a journal entry to the chat. All content escaped."""

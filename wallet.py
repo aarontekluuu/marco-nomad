@@ -1,12 +1,17 @@
 """Wallet module - tracks position state and chain location."""
 
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 STATE_FILE = Path(__file__).parent / "wallet_state.json"
+WALLET_DIR = Path.home() / ".marco"
+WALLET_FILE = WALLET_DIR / "wallet.json"
 MIN_POSITION_USD = 5.0  # Never migrate if position would drop below this
 MIN_MIGRATION_INTERVAL_HOURS = 4  # Cooldown between migrations to prevent thrashing
 MAX_MIGRATIONS = 200  # Cap migration history to prevent wallet_state.json bloat
@@ -88,6 +93,80 @@ def validate_private_key(private_key: str) -> tuple[bool, str, str]:
         return True, "", "web3 not installed — cannot derive address"
     except Exception as e:
         return False, "", f"Key derivation failed: {e}"
+
+
+def create_wallet() -> tuple[str, str]:
+    """Create a new Ethereum wallet for Marco. Returns (address, private_key).
+
+    Stores the key at ~/.marco/wallet.json with restrictive permissions.
+    If a wallet already exists, returns the existing one.
+    SECURITY: File is chmod 600 (owner-read/write only).
+    """
+    WALLET_DIR.mkdir(parents=True, exist_ok=True)
+
+    if WALLET_FILE.exists():
+        data = json.loads(WALLET_FILE.read_text())
+        pk = data.get("privateKey", "")
+        if pk:
+            valid, addr, _ = validate_private_key(pk)
+            if valid and addr:
+                return addr, pk
+
+    # Generate new wallet
+    from eth_account import Account
+    acct = Account.create()
+    wallet_data = {
+        "privateKey": acct.key.hex(),
+        "address": acct.address,
+        "createdAt": datetime.now().isoformat(),
+        "source": "marco-nomad",
+    }
+    WALLET_FILE.write_text(json.dumps(wallet_data, indent=2))
+    os.chmod(WALLET_FILE, 0o600)
+    logger.info(f"Created new Marco wallet: {acct.address}")
+    return acct.address, acct.key.hex()
+
+
+def load_wallet() -> tuple[str, str] | None:
+    """Load existing wallet from ~/.marco/wallet.json or ~/.conway/wallet.json.
+
+    Returns (address, private_key) or None if no wallet exists.
+    Checks Marco's own wallet first, then falls back to Conway x402 wallet.
+    """
+    # 1. Check Marco's own wallet
+    if WALLET_FILE.exists():
+        try:
+            data = json.loads(WALLET_FILE.read_text())
+            pk = data.get("privateKey", "")
+            if pk:
+                valid, addr, _ = validate_private_key(pk)
+                if valid and addr:
+                    return addr, pk
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 2. Fallback: Conway x402 wallet
+    conway_wallet = Path.home() / ".conway" / "wallet.json"
+    if conway_wallet.exists():
+        try:
+            data = json.loads(conway_wallet.read_text())
+            pk = data.get("privateKey", "")
+            if pk:
+                valid, addr, _ = validate_private_key(pk)
+                if valid and addr:
+                    logger.info(f"Using Conway x402 wallet: {addr}")
+                    return addr, pk
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 3. Fallback: env var
+    pk = os.getenv("WALLET_PRIVATE_KEY", "")
+    if pk:
+        valid, addr, _ = validate_private_key(pk)
+        if valid and addr:
+            return addr, pk
+
+    return None
 
 
 def check_wallet_address_match(state: dict, private_key: str) -> tuple[bool, str]:

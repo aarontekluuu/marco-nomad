@@ -414,7 +414,8 @@ async def _run_cycle_inner():
                         continue
 
                     # Execute the bridge transaction on-chain
-                    private_key = os.getenv("WALLET_PRIVATE_KEY")
+                    wallet_info = wallet.load_wallet()
+                    private_key = wallet_info[1] if wallet_info else None
                     rpc_url = lifi.RPC_URLS.get(current_chain)
                     if not private_key or not rpc_url:
                         log(f"  ABORT: Missing WALLET_PRIVATE_KEY or RPC URL for chain {current_chain}")
@@ -515,20 +516,18 @@ async def main():
 
     # SECURITY: Validate wallet configuration at startup (LIVE mode only)
     if not DEMO_MODE:
-        private_key = os.getenv("WALLET_PRIVATE_KEY")
-        if not private_key:
-            log("FATAL: WALLET_PRIVATE_KEY not set for LIVE mode. Exiting.")
+        # Try loading wallet from ~/.marco/, ~/.conway/, or WALLET_PRIVATE_KEY env
+        wallet_info = wallet.load_wallet()
+        if not wallet_info:
+            log("FATAL: No wallet found. Run with Telegram bot (/wallet) or set WALLET_PRIVATE_KEY.")
             sys.exit(1)
-        valid, _, err = wallet.validate_private_key(private_key)
-        if not valid:
-            log(f"FATAL: Invalid private key — {err}")
-            sys.exit(1)
+        wallet_addr, private_key = wallet_info
         state = wallet.load_state()
         match_ok, match_msg = wallet.check_wallet_address_match(state, private_key)
         if not match_ok:
             log(f"FATAL: {match_msg}")
             sys.exit(1)
-        log(f"Wallet verified: {state.get('address', '?')[:10]}...{state.get('address', '?')[-6:]}")
+        log(f"Wallet: {wallet_addr[:10]}...{wallet_addr[-6:]}")
 
     if "--once" in sys.argv:
         await run_cycle()
