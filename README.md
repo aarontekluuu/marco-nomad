@@ -143,6 +143,7 @@ Marco is built for real money, not just demos:
 - **Approval address validation** — ERC20 approval spender verified against known diamond (prevents compromised API from draining tokens)
 - **Exact-amount approvals** — no infinite approvals that could drain the wallet
 - **EIP-1559 gas pricing** — on all transactions including approvals to reduce MEV exposure
+- **Dynamic priority fees** — queries `eth_maxPriorityFee`, bounded [0.05, 5] gwei (adapts to network congestion)
 - **Gas estimation fallback** — `eth_estimateGas` with 20% buffer when quote lacks gasLimit
 - **Approval receipt verification** — confirms approval TX succeeded before attempting bridge TX
 - **Confidence gating** — brain must output >60% confidence to trigger a migration
@@ -157,6 +158,12 @@ Marco is built for real money, not just demos:
 - **0.5% slippage** — tight slippage for USDC-to-USDC bridges (prevents sandwich attacks)
 - **Brain API timeout** — 45s hard cutoff prevents cycle stalls on slow responses
 - **Exponential backoff** — bridge status polling backs off from 5s to 30s (not hammering LI.FI API)
+- **Pending bridge handling** — if status polling times out, migration is recorded with estimated cost and reconciled next cycle
+- **Multi-asset exposure flags** — LP pair pools flagged in brain context to inform migration decisions
+- **Volatile LP filtering** — LP pairs with non-stablecoin components automatically excluded even if DefiLlama flags them as stablecoin
+- **ChainId normalization** — hex chainId from API responses parsed to int before diamond validation (prevents bypass via type confusion)
+- **Concurrent cycle lock** — asyncio lock prevents overlapping cycles from Telegram triggers racing with scheduled runs
+- **Same-chain cost awareness** — pools on the current chain marked with zero bridge cost so brain can evaluate free rebalancing
 
 ## Quick Start
 
@@ -230,7 +237,7 @@ marco-nomad/
 ├── main.py            # Alternative entry with Telegram bot integration
 ├── demo/              # Seed data for dashboard (works without API keys)
 ├── tests/
-│   └── test_core.py   # 64 tests: bridge cost, yield filter, brain parsing, wallet, security
+│   └── test_core.py   # 68 tests: bridge cost, yield filter, brain parsing, wallet, security
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```

@@ -177,7 +177,9 @@ async def execute_quote(
 
     # SECURITY: Validate TX destination is a known LI.FI contract
     tx_to = Web3.to_checksum_address(tx["to"])
-    chain_id = tx.get("chainId", await _call(lambda: w3.eth.chain_id))
+    # chainId may be hex string from API — normalize to int for diamond lookup
+    raw_chain_id = tx.get("chainId")
+    chain_id = _parse_int(raw_chain_id) if raw_chain_id is not None else await _call(lambda: w3.eth.chain_id)
     known_diamond = LIFI_DIAMOND.get(chain_id)
     if known_diamond and tx_to.lower() != known_diamond.lower():
         raise ValueError(
@@ -216,7 +218,13 @@ async def execute_quote(
                 latest = await _call(w3.eth.get_block, "latest")
                 if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
                     approve_build["maxFeePerGas"] = latest.baseFeePerGas * 2
-                    approve_build["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+                    try:
+                        suggested_tip = await _call(w3.eth.max_priority_fee)
+                        min_tip = w3.to_wei(0.05, "gwei")
+                        max_tip = w3.to_wei(5, "gwei")
+                        approve_build["maxPriorityFeePerGas"] = max(min_tip, min(suggested_tip, max_tip))
+                    except Exception:
+                        approve_build["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
             except Exception:
                 pass
             approve_tx = erc20.functions.approve(
@@ -258,7 +266,7 @@ async def execute_quote(
         "value": _parse_int(tx.get("value", 0)),
         "gas": gas_limit,
         "nonce": nonce,
-        "chainId": tx.get("chainId", await _call(lambda: w3.eth.chain_id)),
+        "chainId": chain_id,  # Already parsed to int above
     }
 
     # Prefer EIP-1559 (reduces MEV exposure via base fee mechanism)
@@ -266,7 +274,14 @@ async def execute_quote(
         latest = await _call(w3.eth.get_block, "latest")
         if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
             send_tx["maxFeePerGas"] = latest.baseFeePerGas * 2
-            send_tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+            # Dynamic priority fee: use network suggestion, bounded to [0.05, 5] gwei
+            try:
+                suggested_tip = await _call(w3.eth.max_priority_fee)
+                min_tip = w3.to_wei(0.05, "gwei")
+                max_tip = w3.to_wei(5, "gwei")
+                send_tx["maxPriorityFeePerGas"] = max(min_tip, min(suggested_tip, max_tip))
+            except Exception:
+                send_tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
         elif "gasPrice" in tx:
             send_tx["gasPrice"] = _parse_int(tx["gasPrice"])
     except Exception:

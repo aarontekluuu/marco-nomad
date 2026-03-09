@@ -86,8 +86,20 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+_cycle_lock = asyncio.Lock()
+
+
 async def run_cycle():
-    """Run one decision cycle."""
+    """Run one decision cycle. Lock prevents concurrent execution from Telegram triggers."""
+    if _cycle_lock.locked():
+        log("Cycle already running — skipping triggered cycle")
+        return
+    async with _cycle_lock:
+        await _run_cycle_inner()
+
+
+async def _run_cycle_inner():
+    """Inner cycle logic (always called under _cycle_lock)."""
     state = wallet.load_state()
     log(f"Current state:\n{wallet.format_state(state)}")
 
@@ -190,9 +202,15 @@ async def run_cycle():
                 state["current_pool"] = current_pool
 
         # 4. Enrich candidates with bridge cost data for brain
+        current_chain_name = CHAIN_MAP.get(current_chain, "")
         for pool in candidates:
             chain_name = pool.get("chain", "")
-            if chain_name in bridge_quotes:
+            if chain_name == current_chain_name:
+                # Same-chain move — no bridge needed, zero cost
+                pool["bridge_cost_usd"] = 0.0
+                pool["bridge_cost_pct"] = 0.0
+                pool["bridge_tool"] = "same-chain (no bridge)"
+            elif chain_name in bridge_quotes:
                 pool["bridge_cost_usd"] = bridge_quotes[chain_name]["cost"]["total_cost_usd"]
                 pool["bridge_cost_pct"] = bridge_quotes[chain_name]["cost_pct"]
                 pool["bridge_tool"] = bridge_quotes[chain_name]["cost"]["bridge"]
@@ -316,27 +334,33 @@ async def run_cycle():
                         log(f"  Bridge execution failed: {e}")
                         continue
 
-                    # Verify received amount on destination chain
-                    dest_rpc = lifi.RPC_URLS.get(target_chain_id)
-                    if dest_rpc and tx_result["status"] == "DONE":
-                        actual = await asyncio.to_thread(
-                            wallet.check_onchain_balance,
-                            target_chain_id, wallet_addr, dest_rpc,
-                        )
-                        if actual is not None:
-                            expected_min = fresh_cost["to_amount_min"]
-                            if actual < expected_min * 0.95:
-                                log(f"  WARNING: received ${actual:.2f} < expected min ${expected_min:.2f}")
-                            else:
-                                log(f"  Verified: ${actual:.2f} received on {to_chain_name}")
-                            # Use actual balance — more accurate than estimate
-                            state["position_usd"] = round(actual, 2)
-                            cost_usd = round(move_usd - actual, 2)
-                        else:
-                            # Can't verify — fall back to estimated cost
-                            state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
-                    else:
+                    # Handle PENDING status (polling timed out — bridge may still land)
+                    if tx_result["status"] == "PENDING":
+                        log(f"  WARNING: Bridge status still PENDING after polling timeout. TX: {tx_result['tx_hash']}")
+                        log(f"  Funds may be in transit. Recording migration with estimated cost — reconcile will correct next cycle.")
+                        # Record with estimate — reconcile_balance will fix on next cycle
                         state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+
+                    # Verify received amount on destination chain (only for DONE status)
+                    elif tx_result["status"] == "DONE":
+                        dest_rpc = lifi.RPC_URLS.get(target_chain_id)
+                        if dest_rpc:
+                            actual = await asyncio.to_thread(
+                                wallet.check_onchain_balance,
+                                target_chain_id, wallet_addr, dest_rpc,
+                            )
+                            if actual is not None:
+                                expected_min = fresh_cost["to_amount_min"]
+                                if actual < expected_min * 0.95:
+                                    log(f"  WARNING: received ${actual:.2f} < expected min ${expected_min:.2f}")
+                                else:
+                                    log(f"  Verified: ${actual:.2f} received on {to_chain_name}")
+                                state["position_usd"] = round(actual, 2)
+                                cost_usd = round(move_usd - actual, 2)
+                            else:
+                                state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+                        else:
+                            state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
 
                 if DEMO_MODE:
                     # DEMO: simulate cost deduction

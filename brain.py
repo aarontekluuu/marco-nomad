@@ -12,9 +12,9 @@ SYSTEM_PROMPT = """You are Marco, an autonomous cross-chain yield nomad.
 ## Your Personality
 - **Restless**: You never stay on one chain too long. If yields compress, you move.
 - **Pragmatic**: You only migrate when the math works — spread must exceed bridge costs.
-- **Journaling**: You write about every decision like a travel journal. First person, vivid.
+- **Journaling**: You write about every decision like a travel journal. First person, vivid. Always mention the bridge tool when migrating (e.g. "LI.FI routed me through Stargate" or "bridge via LI.FI cost $0.18").
 - **Risk-aware**: You're a nomad, not a fund manager. You move your whole bag to one chain at a time — but you're cautious about which chain you trust and how long you stay.
-- **Opinionated**: You have views on chains, protocols, and market conditions. Share them.
+- **Opinionated**: You have views on chains, protocols, market conditions, and bridge routes. Share them.
 
 ## Your Voice
 Write like a seasoned trader keeping a personal journal. Short, punchy observations.
@@ -126,12 +126,15 @@ async def decide(
             f"APY: {apy:.2f}% (30d avg: {mean30d:.2f}%) | TVL: ${opp.get('tvlUsd', 0):,.0f}"
         )
         if opp.get("bridge_cost_usd"):
-            line += f" | Bridge: ${opp['bridge_cost_usd']:.2f} ({opp.get('bridge_cost_pct', 0):.1f}%)"
+            bridge_tool = opp.get("bridge_tool", "unknown")
+            line += f" | Bridge via LI.FI ({bridge_tool}): ${opp['bridge_cost_usd']:.2f} ({opp.get('bridge_cost_pct', 0):.1f}%)"
         flags = []
         if opp.get("_apy_spike"):
             flags.append("⚠ APY SPIKE")
         if opp.get("_trusted"):
             flags.append("✓ trusted")
+        if opp.get("_multi_asset"):
+            flags.append("LP pair")
         if flags:
             line += f" | {' '.join(flags)}"
         context_parts.append(line)

@@ -95,8 +95,21 @@ def filter_pools(
         apy = p.get("apy") or 0
         if apy < min_apy or apy > max_apy:
             continue
-        if stablecoin_only and not p.get("stablecoin"):
-            continue
+        if stablecoin_only:
+            if not p.get("stablecoin"):
+                continue
+            # Extra guard: DefiLlama's stablecoin flag can be unreliable for LP pairs.
+            # Skip pools whose symbol contains known volatile tokens mixed with stables.
+            symbol = (p.get("symbol") or "").upper()
+            if "-" in symbol or "/" in symbol:
+                # LP pair — check both sides are stablecoins
+                _STABLE_TOKENS = {"USDC", "USDT", "DAI", "FRAX", "LUSD", "GUSD", "BUSD",
+                                  "USDC.E", "USDT.E", "USDBC", "USDA", "USDE", "SUSD",
+                                  "CUSD", "DOLA", "MIM", "TUSD", "PYUSD", "CRVUSD", "GHO",
+                                  "MSUSD", "SUSDCE"}
+                parts = [t.strip() for t in symbol.replace("/", "-").split("-")]
+                if not all(t in _STABLE_TOKENS for t in parts if t):
+                    continue  # Has a volatile component — skip
         if exclude_outliers and p.get("outlier"):
             continue
         if no_il_risk and p.get("ilRisk") == "yes":
@@ -113,14 +126,19 @@ def filter_pools(
         project = (p.get("project") or "").lower()
         p["_trusted"] = project in TRUSTED_PROTOCOLS
 
+        # Flag pools with single-asset exposure risk (e.g. "multi" exposure = LP pair)
+        exposure = (p.get("exposure") or "").lower()
+        p["_multi_asset"] = exposure == "multi"
+
         filtered.append(p)
 
     # Sort by apyMean30d (sustainable yield) — more reliable than spot APY or apyBase
-    # Trusted protocols get a 1.5x boost in sort score
+    # Light trust boost (1.15x) to surface trusted protocols without burying higher yields.
+    # The brain makes the final trust vs. yield tradeoff — ranking just ensures variety.
     def _sort_key(x):
         base = x.get("apyMean30d") or x.get("apyBase") or x.get("apy") or 0
         if x.get("_trusted"):
-            base *= 1.5
+            base *= 1.15  # Mild boost — enough to break ties, not dominate
         if x.get("_apy_spike"):
             base *= 0.5  # Penalize spikes in ranking
         return -base

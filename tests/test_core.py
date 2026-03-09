@@ -371,6 +371,24 @@ class TestFilterPools:
         result = filter_pools(pools, min_apy=3.0)
         assert len(result) == 0
 
+    def test_volatile_lp_pair_filtered(self):
+        """LP pairs with volatile tokens should be filtered even if stablecoin=True."""
+        volatile_lp = _pool(symbol="USDC-WETH", stablecoin=True)
+        stable_lp = _pool(symbol="USDC-USDT", stablecoin=True)
+        single = _pool(symbol="USDC", stablecoin=True)
+        result = filter_pools([volatile_lp, stable_lp, single], stablecoin_only=True)
+        symbols = [r["symbol"] for r in result]
+        assert "USDC-WETH" not in symbols, "Volatile LP should be filtered"
+        assert "USDC-USDT" in symbols, "Stable-stable LP should pass"
+        assert "USDC" in symbols, "Single stablecoin should pass"
+
+    def test_chainid_hex_parsing(self):
+        """chainId as hex string should parse correctly for diamond lookup."""
+        # Base = 8453 = 0x2105
+        assert _parse_int("0x2105") == 8453
+        assert _parse_int("0xa") == 10  # Optimism
+        assert _parse_int("0xa4b1") == 42161  # Arbitrum
+
 
 # ---------------------------------------------------------------------------
 # wallet.py — can_migrate, save_state, state round-trip
@@ -564,6 +582,18 @@ class TestFilterPoolsCacheSafety:
         r2 = filter_pools([untrusted], min_apy=3.0)
         assert r2[0]["_trusted"] is False
 
+    def test_multi_asset_flag(self):
+        """Pools with 'multi' exposure should be flagged."""
+        lp = _pool(apy=10.0)
+        lp["exposure"] = "multi"
+        single = _pool(apy=10.0)
+        single["exposure"] = "single"
+        results = filter_pools([lp, single], min_apy=3.0)
+        multi_results = [r for r in results if r["_multi_asset"]]
+        single_results = [r for r in results if not r["_multi_asset"]]
+        assert len(multi_results) == 1
+        assert len(single_results) == 1
+
 
 # ---------------------------------------------------------------------------
 # lifi.py — gas fallback
@@ -613,3 +643,19 @@ class TestSecurityValidations:
         from lifi import LIFI_DIAMOND
         addresses = set(LIFI_DIAMOND.values())
         assert len(addresses) == 1, f"Expected 1 diamond address, got {addresses}"
+
+    def test_priority_fee_bounds(self):
+        """Dynamic priority fee should be bounded between 0.05 and 5 gwei."""
+        # Replicate the bounding logic from lifi.py without web3 import
+        gwei = 10**9
+        min_tip = int(0.05 * gwei)  # 50_000_000
+        max_tip = int(5 * gwei)     # 5_000_000_000
+        # Low suggestion gets raised to floor
+        low = int(0.001 * gwei)
+        assert max(min_tip, min(low, max_tip)) == min_tip
+        # High suggestion gets capped
+        high = int(100 * gwei)
+        assert max(min_tip, min(high, max_tip)) == max_tip
+        # Normal suggestion passes through
+        normal = int(1.5 * gwei)
+        assert max(min_tip, min(normal, max_tip)) == normal
