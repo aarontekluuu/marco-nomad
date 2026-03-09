@@ -86,17 +86,27 @@ async def run_cycle(client: httpx.AsyncClient, agent_state: dict, bot: MarcoBot 
     # Save journal
     agent_state.setdefault("journal", []).append(journal_entry)
 
-    # 6. Execute moves (record state changes, no real tx for MVP)
+    # 6. Execute moves
     if decision["action"] in ("migrate", "rebalance"):
         for move in decision.get("moves", []):
             to_chain_id = CHAIN_MAP_REVERSE.get(move["to_chain"])
             if to_chain_id and to_chain_id != current_chain:
-                # Find the target pool
                 target_pool = next(
                     (o for o in opportunities if o["chain"] == move["to_chain"]),
                     {"symbol": "?", "project": "?", "apy": 0, "chain": move["to_chain"]},
                 )
                 cost = quotes.get(move["to_chain"], {}).get("total_cost_usd", 0)
+
+                if DEMO_MODE:
+                    log.info(f"[DEMO] Would migrate to {move['to_chain']} via LI.FI (cost: ${cost:.2f})")
+                else:
+                    from lifi import execute_quote, RPC_URLS
+                    from wallet import load_state as _ls
+                    rpc = RPC_URLS.get(current_chain)
+                    if rpc and opp_chain_id in quotes:
+                        tx_hash = await execute_quote(quote, _ls().get("private_key", ""), rpc)
+                        log.info(f"TX submitted: {tx_hash}")
+
                 record_migration(state, current_chain, to_chain_id, target_pool, cost, move["reason"])
                 log.info(f"Migrated to {move['to_chain']} (chain {to_chain_id})")
 
@@ -123,7 +133,8 @@ async def main():
         log.info("Telegram bot started")
 
     async with httpx.AsyncClient() as client:
-        log.info("Marco the Nomad is awake.")
+        mode = "DEMO (simulated)" if DEMO_MODE else "LIVE (real execution)"
+        log.info(f"Marco the Nomad is awake. Mode: {mode}")
         log.info(f"Position: {format_state(load_state())}")
         log.info(f"Cycle interval: {CYCLE_INTERVAL}s")
 
