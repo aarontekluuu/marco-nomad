@@ -315,10 +315,20 @@ async def _run_cycle_inner():
                     log(f"  Skip {to_chain_name}: no pool or chain ID found")
                     continue
 
-                # Enforce bridge cost threshold
-                quote_data = bridge_quotes.get(to_chain_name)
+                # Determine move type and find the right quote
+                target_pool_token = wallet._infer_pool_token(target_pool)
+                is_same_chain = target_chain_id == current_chain
+                is_swap = is_same_chain and target_pool_token != current_token
+
+                if is_swap:
+                    swap_key = f"{to_chain_name} swap {current_token}→{target_pool_token}"
+                    quote_data = bridge_quotes.get(swap_key)
+                else:
+                    quote_data = bridge_quotes.get(to_chain_name)
+
+                # Enforce bridge/swap cost threshold
                 if quote_data and quote_data["cost_pct"] > MAX_BRIDGE_COST_PCT:
-                    log(f"  BLOCKED: {to_chain_name} bridge cost {quote_data['cost_pct']:.2f}% exceeds {MAX_BRIDGE_COST_PCT}% limit")
+                    log(f"  BLOCKED: {to_chain_name} cost {quote_data['cost_pct']:.2f}% exceeds {MAX_BRIDGE_COST_PCT}% limit")
                     continue
 
                 cost_usd = quote_data["cost"]["total_cost_usd"] if quote_data else 0
@@ -337,14 +347,28 @@ async def _run_cycle_inner():
                 else:
                     # Re-fetch quote right before execution — the original was fetched
                     # before brain.decide() which adds 5-30s of staleness
-                    log(f"  Re-fetching fresh quote for {to_chain_name}...")
-                    from_token = wallet.USDC.get(current_chain)
-                    to_token = wallet.USDC.get(target_chain_id)
-                    amount_wei = str(int(move_usd * 10**wallet.USDC_DECIMALS))
+                    move_label = "swap" if is_swap else "bridge"
+                    log(f"  Re-fetching fresh {move_label} quote for {to_chain_name}...")
+
+                    # Resolve correct from/to token addresses for this move type
+                    exec_from_token = current_token_addr
+                    if is_swap:
+                        target_stable = wallet.STABLECOINS.get((target_chain_id, target_pool_token))
+                        exec_to_token = target_stable["address"] if target_stable else None
+                        exec_to_chain = current_chain  # Same-chain swap
+                    else:
+                        exec_to_token = wallet.USDC.get(target_chain_id)
+                        exec_to_chain = target_chain_id
+
+                    if not exec_from_token or not exec_to_token:
+                        log(f"  ABORT: Cannot resolve token addresses for {move_label}")
+                        continue
+
+                    amount_wei = str(int(move_usd * 10**current_token_decimals))
                     try:
                         fresh_quote = await lifi.get_quote(
-                            client, current_chain, target_chain_id,
-                            from_token, to_token, amount_wei, wallet_addr,
+                            client, current_chain, exec_to_chain,
+                            exec_from_token, exec_to_token, amount_wei, wallet_addr,
                             slippage=SLIPPAGE, api_key=LIFI_API_KEY,
                         )
                         fresh_cost = lifi.calc_bridge_cost(fresh_quote)
@@ -369,7 +393,7 @@ async def _run_cycle_inner():
                     if not match_ok:
                         log(f"  ABORT: {match_msg}")
                         continue
-                    log(f"  Executing bridge to {to_chain_name}...")
+                    log(f"  Executing {move_label} to {to_chain_name}...")
                     try:
                         tx_result = await lifi.execute_quote(
                             fresh_quote, private_key, rpc_url,
