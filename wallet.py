@@ -2,10 +2,13 @@
 
 import json
 import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 STATE_FILE = Path(__file__).parent / "wallet_state.json"
+MIN_POSITION_USD = 5.0  # Never migrate if position would drop below this
+MIN_MIGRATION_INTERVAL_HOURS = 4  # Cooldown between migrations to prevent thrashing
 
 # Well-known USDC addresses per chain (must match yield_scanner.CHAIN_MAP)
 USDC = {
@@ -39,8 +42,40 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    """Save wallet state to disk."""
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Save wallet state to disk atomically (write to tmp, then rename)."""
+    data = json.dumps(state, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=STATE_FILE.parent, suffix=".tmp")
+    try:
+        os.write(fd, data.encode())
+        os.close(fd)
+        fd = -1  # Mark as closed
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def can_migrate(state: dict, cost_usd: float) -> tuple[bool, str]:
+    """Check if migration is safe. Returns (allowed, reason)."""
+    position = state.get("position_usd", 0)
+    if position - cost_usd < MIN_POSITION_USD:
+        return False, f"Position ${position:.2f} - bridge ${cost_usd:.2f} = ${position - cost_usd:.2f} < min ${MIN_POSITION_USD}"
+
+    migrations = state.get("migrations", [])
+    if migrations:
+        last_ts = migrations[-1].get("timestamp", "")
+        try:
+            last_dt = datetime.fromisoformat(last_ts)
+            hours_since = (datetime.now() - last_dt).total_seconds() / 3600
+            if hours_since < MIN_MIGRATION_INTERVAL_HOURS:
+                return False, f"Cooldown: {hours_since:.1f}h since last migration (min {MIN_MIGRATION_INTERVAL_HOURS}h)"
+        except (ValueError, TypeError):
+            pass
+
+    return True, "ok"
 
 
 def record_migration(state: dict, from_chain: int, to_chain: int, pool: dict, cost_usd: float, reason: str):

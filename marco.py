@@ -179,6 +179,12 @@ async def run_cycle():
 
                 cost_usd = quote_data["cost"]["total_cost_usd"] if quote_data else 0
 
+                # Safety check: min balance and migration cooldown
+                allowed, block_reason = wallet.can_migrate(state, cost_usd)
+                if not allowed:
+                    log(f"  SAFETY BLOCK: {block_reason}")
+                    continue
+
                 if DEMO_MODE:
                     log(f"  [DEMO] Would migrate to {to_chain_name} via LI.FI (cost: ${cost_usd:.2f})")
                 else:
