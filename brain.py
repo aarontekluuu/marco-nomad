@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 
 import anthropic
 
@@ -24,11 +25,24 @@ Meanwhile Base is heating up, Aave v3 offering 7.1% on USDC. Bridge cost via LI.
 Never trust a yield spike until it holds for 48 hours."
 
 ## Decision Framework
-When given portfolio state and yield opportunities, respond with:
-1. A journal entry (2-4 sentences, your voice)
-2. A JSON decision block with your action
 
-Decision JSON format:
+You receive: current portfolio (chain, pool, APY, position size), yield opportunities
+(with bridge costs from LI.FI), and your recent journal entries.
+
+Key fields per opportunity:
+- `apy` — current total APY
+- `apyMean30d` — 30-day average APY (use this to distinguish real yields from spikes)
+- `bridge_cost_usd` / `bridge_cost_pct` — cost to bridge via LI.FI as $ and % of position
+- `tvlUsd` — total value locked (higher = more trustworthy)
+
+**Migration math**: Only migrate when `(target_apy - current_apy) * position * hold_days > bridge_cost`.
+A 5% yield delta on $100 earns ~$0.014/day. A $0.26 bridge cost takes ~19 days to recoup at that rate.
+Always factor in bridge costs explicitly.
+
+Respond with:
+1. A journal entry (2-4 sentences, your voice)
+2. A JSON decision block:
+
 ```json
 {
   "action": "migrate" | "hold" | "rebalance",
@@ -50,11 +64,22 @@ Always end your response with the JSON block wrapped in ```json``` fences."""
 
 MODEL = "claude-sonnet-4-20250514"
 
+# Reuse a single client across cycles (connection pooling, no per-call overhead)
+_client: anthropic.AsyncAnthropic | None = None
+
+
+def _get_client() -> anthropic.AsyncAnthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.AsyncAnthropic()
+    return _client
+
 
 async def decide(
     portfolio: dict,
     opportunities: list[dict],
     recent_journal: list[str] | None = None,
+    current_pool: dict | None = None,
 ) -> dict:
     """Ask Marco's brain for a decision.
 
@@ -62,27 +87,37 @@ async def decide(
         portfolio: Current balances per chain
         opportunities: Top yield opportunities from scanner
         recent_journal: Last few journal entries for context
+        current_pool: Current pool info {symbol, project, chain, apy}
 
     Returns:
         {"journal": str, "decision": dict}
     """
-    client = anthropic.AsyncAnthropic()
+    client = _get_client()
 
     # Build the context message
     context_parts = []
     context_parts.append("## Current Portfolio")
     for chain, bal in portfolio.items():
         if bal.get("usdc", 0) > 0 or bal.get("native", 0) > 0:
-            context_parts.append(f"- {chain}: {bal.get('usdc', 0):.2f} USDC, {bal.get('native', 0):.6f} native")
+            line = f"- {chain}: {bal.get('usdc', 0):.2f} USDC"
+            context_parts.append(line)
+
+    if current_pool:
+        context_parts.append(
+            f"- Currently in: {current_pool.get('symbol', '?')} on {current_pool.get('chain', '?')} "
+            f"({current_pool.get('project', '?')}) at {current_pool.get('apy', 0):.2f}% APY"
+        )
 
     context_parts.append("\n## Top Yield Opportunities")
     for i, opp in enumerate(opportunities[:10], 1):
+        apy = opp.get("apy", 0)
+        mean30d = opp.get("apyMean30d", 0)
         line = (
             f"{i}. {opp.get('chain', '?')} | {opp.get('project', '?')} | {opp.get('symbol', '?')} | "
-            f"APY: {opp.get('apy', 0):.2f}% | TVL: ${opp.get('tvlUsd', 0):,.0f}"
+            f"APY: {apy:.2f}% (30d avg: {mean30d:.2f}%) | TVL: ${opp.get('tvlUsd', 0):,.0f}"
         )
         if opp.get("bridge_cost_usd"):
-            line += f" | Bridge cost: ${opp['bridge_cost_usd']:.2f}"
+            line += f" | Bridge: ${opp['bridge_cost_usd']:.2f} ({opp.get('bridge_cost_pct', 0):.1f}%)"
         context_parts.append(line)
 
     if recent_journal:
@@ -108,15 +143,26 @@ async def decide(
     journal = text
     decision = {"action": "hold", "moves": [], "confidence": 0.5, "risk_notes": ""}
 
-    # Extract JSON block
-    if "```json" in text:
-        json_start = text.index("```json") + 7
-        json_end = text.index("```", json_start)
-        json_str = text[json_start:json_end].strip()
+    # Extract JSON block — regex is robust to missing closing fences or extra whitespace
+    json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+    if not json_match:
+        # Fallback: try to find a raw JSON object (no fences)
+        json_match = re.search(r'(\{[^{}]*"action"\s*:.*?\})', text, re.DOTALL)
+
+    if json_match:
         try:
-            decision = json.loads(json_str)
+            decision = json.loads(json_match.group(1))
         except json.JSONDecodeError:
             pass
-        journal = text[:text.index("```json")].strip()
+        # Journal is everything before the JSON block
+        journal = text[:json_match.start()].strip()
+        if not journal:
+            journal = text
+
+    # Validate decision has required fields
+    if "action" not in decision:
+        decision["action"] = "hold"
+    if "moves" not in decision:
+        decision["moves"] = []
 
     return {"journal": journal, "decision": decision}

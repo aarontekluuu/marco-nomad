@@ -1,8 +1,15 @@
 """DefiLlama yield scanner - finds best yields across chains."""
 
+import time
+
 import httpx
 
 POOLS_URL = "https://yields.llama.fi/pools"
+
+# Cache to avoid re-fetching 5-10MB pool data every cycle
+_pool_cache: list[dict] = []
+_pool_cache_ts: float = 0
+CACHE_TTL = 300  # 5 minutes
 
 # LI.FI chain ID -> DefiLlama chain name
 CHAIN_MAP = {
@@ -23,10 +30,18 @@ CHAIN_MAP_REVERSE = {v: k for k, v in CHAIN_MAP.items()}
 
 
 async def fetch_pools(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch all yield pools from DefiLlama."""
+    """Fetch all yield pools from DefiLlama, with caching."""
+    global _pool_cache, _pool_cache_ts
+    if _pool_cache and (time.time() - _pool_cache_ts) < CACHE_TTL:
+        return _pool_cache
     resp = await client.get(POOLS_URL, timeout=30)
     resp.raise_for_status()
-    return resp.json()["data"]
+    body = resp.json()
+    if not isinstance(body, dict) or "data" not in body:
+        raise ValueError(f"Unexpected DefiLlama response: {str(body)[:200]}")
+    _pool_cache = body["data"]
+    _pool_cache_ts = time.time()
+    return _pool_cache
 
 
 def filter_pools(

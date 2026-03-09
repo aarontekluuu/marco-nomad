@@ -144,59 +144,160 @@ def calc_bridge_cost(quote: dict) -> dict:
     }
 
 
-async def execute_quote(quote: dict, private_key: str, rpc_url: str) -> str:
+ERC20_ABI = [
+    {
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "spender", "type": "address"},
+        ],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+]
+
+MAX_UINT256 = 2**256 - 1  # Kept for reference but not used in approvals (exact amount preferred)
+
+
+def _parse_int(val) -> int:
+    """Parse an int from hex string (0x...) or decimal string."""
+    if isinstance(val, int):
+        return val
+    s = str(val)
+    if s.startswith("0x") or s.startswith("0X"):
+        return int(s, 16)
+    return int(s)
+
+
+QUOTE_MAX_AGE_SECONDS = 60  # Re-fetch quote if older than this
+
+
+async def execute_quote(
+    quote: dict,
+    private_key: str,
+    rpc_url: str,
+    poll_status_client: httpx.AsyncClient | None = None,
+    api_key: str | None = None,
+    quote_fetched_at: float | None = None,
+    refetch_fn=None,
+) -> dict:
     """Sign and send a quote's transactionRequest on-chain.
 
-    Returns the transaction hash.
+    Returns {"tx_hash": str, "status": str, "receipt": dict | None}.
+
+    Args:
+        quote_fetched_at: Unix timestamp when quote was fetched. If stale, refetch.
+        refetch_fn: async callable() -> dict that returns a fresh quote. Required if
+                    quote_fetched_at is provided and quote might be stale.
     """
+    import asyncio
+    import time
     from web3 import Web3
+
+    # Guard: re-fetch stale quotes to avoid executing with outdated routes/gas
+    if quote_fetched_at and refetch_fn:
+        age = time.time() - quote_fetched_at
+        if age > QUOTE_MAX_AGE_SECONDS:
+            quote = await refetch_fn()
 
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     tx = quote["transactionRequest"]
     sender = Web3.to_checksum_address(tx["from"])
+    from_amount = int(quote["action"]["fromAmount"])
 
-    # ERC20 approval if needed
+    # 1. Check existing allowance before approving (saves gas on repeat bridges)
     approval_addr = quote["estimate"].get("approvalAddress")
     from_token = quote["action"]["fromToken"]["address"]
     if approval_addr and from_token != NATIVE:
         erc20 = w3.eth.contract(
             address=Web3.to_checksum_address(from_token),
-            abi=[{
-                "inputs": [
-                    {"name": "spender", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "name": "approve",
-                "outputs": [{"name": "", "type": "bool"}],
-                "type": "function",
-            }],
+            abi=ERC20_ABI,
         )
-        approve_tx = erc20.functions.approve(
-            Web3.to_checksum_address(approval_addr),
-            int(quote["action"]["fromAmount"]),
-        ).build_transaction({
-            "from": sender,
-            "nonce": w3.eth.get_transaction_count(sender),
-        })
-        signed = w3.eth.account.sign_transaction(approve_tx, private_key)
-        w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(signed.hash)
+        current_allowance = erc20.functions.allowance(
+            sender, Web3.to_checksum_address(approval_addr)
+        ).call()
 
-    # Send the bridge/swap tx
+        if current_allowance < from_amount:
+            # Approve exact amount — MAX_UINT256 is a security risk if router is compromised
+            nonce = w3.eth.get_transaction_count(sender, "pending")
+            approve_tx = erc20.functions.approve(
+                Web3.to_checksum_address(approval_addr),
+                from_amount,
+            ).build_transaction({"from": sender, "nonce": nonce})
+            signed = w3.eth.account.sign_transaction(approve_tx, private_key)
+            w3.eth.send_raw_transaction(signed.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(signed.hash, timeout=120)
+
+    # 2. Build TX with EIP-1559 gas if available, fallback to legacy
+    nonce = w3.eth.get_transaction_count(sender, "pending")
     send_tx = {
         "from": sender,
         "to": Web3.to_checksum_address(tx["to"]),
         "data": tx["data"],
-        "value": int(tx["value"], 16),
-        "gas": int(tx["gasLimit"], 16),
-        "nonce": w3.eth.get_transaction_count(sender),
+        "value": _parse_int(tx.get("value", 0)),
+        "gas": _parse_int(tx.get("gasLimit", tx.get("gas", 200000))),
+        "nonce": nonce,
+        "chainId": tx.get("chainId", w3.eth.chain_id),
     }
-    if "gasPrice" in tx:
-        send_tx["gasPrice"] = int(tx["gasPrice"], 16)
 
+    # Prefer EIP-1559 (reduces MEV exposure via base fee mechanism)
+    try:
+        latest = w3.eth.get_block("latest")
+        if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
+            send_tx["maxFeePerGas"] = latest.baseFeePerGas * 2
+            send_tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+        elif "gasPrice" in tx:
+            send_tx["gasPrice"] = _parse_int(tx["gasPrice"])
+    except Exception:
+        if "gasPrice" in tx:
+            send_tx["gasPrice"] = _parse_int(tx["gasPrice"])
+
+    # 3. Sign and send
     signed = w3.eth.account.sign_transaction(send_tx, private_key)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    return tx_hash.hex()
+    tx_hash_hex = tx_hash.hex()
+
+    # 4. Wait for on-chain confirmation
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+    if receipt.status != 1:
+        return {"tx_hash": tx_hash_hex, "status": "FAILED", "receipt": dict(receipt)}
+
+    # 5. Poll LI.FI bridge status until complete
+    result = {"tx_hash": tx_hash_hex, "status": "PENDING", "receipt": dict(receipt)}
+
+    if poll_status_client:
+        bridge = quote.get("tool", "")
+        from_chain = quote.get("action", {}).get("fromChainId")
+        to_chain = quote.get("action", {}).get("toChainId")
+
+        for attempt in range(60):  # Poll for up to 5 minutes
+            await asyncio.sleep(5)
+            try:
+                status = await check_status(
+                    poll_status_client, tx_hash_hex,
+                    from_chain=from_chain, to_chain=to_chain,
+                    bridge=bridge, api_key=api_key,
+                )
+                bridge_status = status.get("status", "PENDING")
+                if bridge_status == "DONE":
+                    result["status"] = "DONE"
+                    break
+                elif bridge_status == "FAILED":
+                    result["status"] = "FAILED"
+                    break
+            except Exception:
+                continue
+
+    return result
 
 
 RPC_URLS = {

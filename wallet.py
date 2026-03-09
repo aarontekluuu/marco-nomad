@@ -2,17 +2,24 @@
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 STATE_FILE = Path(__file__).parent / "wallet_state.json"
 
-# Well-known USDC addresses per chain
+# Well-known USDC addresses per chain (must match yield_scanner.CHAIN_MAP)
 USDC = {
-    1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    42161: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-    10: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
-    137: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",       # Ethereum
+    8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",     # Base
+    42161: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",    # Arbitrum
+    10: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",       # Optimism
+    137: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",      # Polygon
+    56: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",       # BSC
+    43114: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",   # Avalanche
+    250: "0x04068DA6C83AFCFA0e13ba15A6696662335D5B75",      # Fantom
+    324: "0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4",      # zkSync Era
+    59144: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",    # Linea (USDC.e)
+    534352: "0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4",  # Scroll
 }
 
 USDC_DECIMALS = 6
@@ -39,6 +46,7 @@ def save_state(state: dict):
 def record_migration(state: dict, from_chain: int, to_chain: int, pool: dict, cost_usd: float, reason: str):
     """Record a migration decision."""
     state["migrations"].append({
+        "timestamp": datetime.now().isoformat(),
         "from_chain": from_chain,
         "to_chain": to_chain,
         "pool_symbol": pool.get("symbol", "?"),
