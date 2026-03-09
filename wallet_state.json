@@ -1,7 +1,31 @@
 {
   "address": "0xe3BC2119b9ea90722eD54Ab8FCeb54f6F6C247Bf",
   "current_chain": 8453,
-  "current_pool": null,
-  "position_usd": 100.0,
-  "migrations": []
+  "current_pool": {
+    "symbol": "USDC",
+    "project": "merkl",
+    "chain": "Base",
+    "apy": 28.47
+  },
+  "position_usd": 99.84,
+  "migrations": [
+    {
+      "from_chain": 8453,
+      "to_chain": 10,
+      "pool_symbol": "USDC-MSUSD",
+      "pool_project": "velodrome-v2",
+      "pool_apy": 16.2,
+      "cost_usd": 0.26,
+      "reason": "Base yields compressed 3 points, Optimism Velodrome offering 4.1% higher spread"
+    },
+    {
+      "from_chain": 10,
+      "to_chain": 8453,
+      "pool_symbol": "USDC",
+      "pool_project": "merkl",
+      "pool_apy": 28.47,
+      "cost_usd": 0.18,
+      "reason": "Optimism Velodrome dropped to 14.62%, Base Merkl surging at 28.47% \u2014 13.85% spread justifies migration"
+    }
+  ]
 }
