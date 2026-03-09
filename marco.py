@@ -142,7 +142,7 @@ async def run_cycle():
         # Fetch all quotes in parallel
         quote_tasks = []
         seen_chains = set()
-        for pool in candidates[:5]:
+        for pool in candidates[:10]:
             target_chain = CHAIN_MAP_REVERSE.get(pool.get("chain"))
             if not target_chain or target_chain == current_chain or target_chain in seen_chains:
                 continue

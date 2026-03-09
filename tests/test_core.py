@@ -309,6 +309,13 @@ class TestFilterPools:
         assert len(result) == 1
         assert result[0]["apy"] == 50.0
 
+    def test_default_max_apy_rejects_100pct(self):
+        """Default cap (50%) filters out sketchy 100%+ stablecoin yields."""
+        pools = [_pool(apy=80.0), _pool(apy=30.0)]
+        result = filter_pools(pools)  # Uses default max_apy=50.0
+        assert len(result) == 1
+        assert result[0]["apy"] == 30.0
+
     def test_stablecoin_filter(self):
         pools = [_pool(stablecoin=True), _pool(stablecoin=False, symbol="ETH")]
         result = filter_pools(pools, stablecoin_only=True)

@@ -75,7 +75,7 @@ def filter_pools(
     chains: list[int] | None = None,
     min_tvl: float = 500_000,
     min_apy: float = 3.0,
-    max_apy: float = 100.0,
+    max_apy: float = 50.0,
     stablecoin_only: bool = True,
     exclude_outliers: bool = True,
     no_il_risk: bool = True,
