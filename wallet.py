@@ -202,10 +202,9 @@ def create_wallet() -> tuple[str, str]:
 
 
 def load_wallet() -> tuple[str, str] | None:
-    """Load existing wallet from ~/.marco/wallet.json or ~/.conway/wallet.json.
+    """Load existing wallet from ~/.marco/wallet.json.
 
     Returns (address, private_key) or None if no wallet exists.
-    Checks Marco's own wallet first, then falls back to Conway x402 wallet.
     """
     # 1. Check Marco's own wallet
     if WALLET_FILE.exists():
@@ -219,21 +218,7 @@ def load_wallet() -> tuple[str, str] | None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # 2. Fallback: Conway x402 wallet
-    conway_wallet = Path.home() / ".conway" / "wallet.json"
-    if conway_wallet.exists():
-        try:
-            data = json.loads(conway_wallet.read_text())
-            pk = data.get("privateKey", "")
-            if pk:
-                valid, addr, _ = validate_private_key(pk)
-                if valid and addr:
-                    logger.info(f"Using Conway x402 wallet: {addr}")
-                    return addr, pk
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # 3. Fallback: env var
+    # 2. Fallback: env var
     pk = os.getenv("WALLET_PRIVATE_KEY", "")
     if pk:
         valid, addr, _ = validate_private_key(pk)
