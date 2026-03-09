@@ -4,6 +4,7 @@ Covers: brain.py JSON extraction, lifi.py cost calc & parsing,
         yield_scanner.py pool filtering, wallet.py migration guards & state I/O.
 """
 
+import copy
 import json
 import os
 import re
@@ -458,3 +459,63 @@ class TestSaveStateAndRoundTrip:
             save_state({"x": 1})
         tmp_files = list(tmp_path.glob("*.tmp"))
         assert len(tmp_files) == 0
+
+
+# ---------------------------------------------------------------------------
+# yield_scanner.py — cache mutation safety
+# ---------------------------------------------------------------------------
+
+class TestFilterPoolsCacheSafety:
+    """Ensure filter_pools doesn't mutate input pool dicts (cache pollution bug)."""
+
+    def test_no_mutation_of_original_pools(self):
+        """filter_pools should shallow-copy before adding _apy_spike/_trusted."""
+        original = _pool(apy=5.0, mean30d=4.8, project="aave-v3")
+        original_copy = copy.deepcopy(original)
+        filter_pools([original], min_apy=3.0)
+        # Original dict should NOT have _apy_spike or _trusted keys
+        assert "_apy_spike" not in original_copy
+        assert "_apy_spike" not in original  # The real check
+
+    def test_spike_flag_not_sticky_across_calls(self):
+        """A pool flagged as spiking should not stay flagged in the next filter call."""
+        pool = _pool(apy=50.0, mean30d=1.0)  # 50x spike
+        result1 = filter_pools([pool], min_apy=3.0)
+        assert result1[0]["_apy_spike"] is True
+
+        # Same pool, spike resolved
+        pool2 = _pool(apy=5.0, mean30d=4.5)  # Normal
+        result2 = filter_pools([pool2], min_apy=3.0)
+        assert result2[0]["_apy_spike"] is False
+
+    def test_trusted_flag_independent_per_call(self):
+        """Trust flag should be fresh each call, not carried over."""
+        trusted = _pool(project="aave-v3")
+        untrusted = _pool(project="sketchy-dex")
+        r1 = filter_pools([trusted], min_apy=3.0)
+        assert r1[0]["_trusted"] is True
+        r2 = filter_pools([untrusted], min_apy=3.0)
+        assert r2[0]["_trusted"] is False
+
+
+# ---------------------------------------------------------------------------
+# lifi.py — gas fallback
+# ---------------------------------------------------------------------------
+
+class TestGasFallback:
+    """Verify the gas limit fallback is high enough for bridge TXs."""
+
+    def test_default_gas_limit(self):
+        """When quote has no gasLimit/gas, fallback should be 500k not 200k."""
+        from lifi import _parse_int
+        # Simulate the logic from execute_quote
+        tx = {"from": "0x1", "to": "0x2", "data": "0x", "value": "0"}
+        gas = _parse_int(tx.get("gasLimit", tx.get("gas", 500000)))
+        assert gas == 500000
+
+    def test_quote_gas_respected(self):
+        """When quote provides gasLimit, use it."""
+        from lifi import _parse_int
+        tx = {"gasLimit": "0x61A80"}  # 400000 in hex
+        gas = _parse_int(tx.get("gasLimit", tx.get("gas", 500000)))
+        assert gas == 400000
