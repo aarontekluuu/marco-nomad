@@ -196,8 +196,14 @@ cp .env.template .env
 # Run one cycle (demo mode — no real transactions)
 python marco.py --once
 
-# Run continuous (hourly cycles)
+# Run autonomous with Telegram bot (15min cycles)
+python main.py
+
+# Run continuous without Telegram (hourly cycles)
 python marco.py
+
+# Deploy to Conway sandbox (always-on cloud)
+./deploy.sh
 
 # Run tests
 pytest tests/ -v
@@ -244,10 +250,11 @@ marco-nomad/
 ├── wallet.py          # Position tracking, balance reconciliation, safety guards
 ├── dashboard.py       # Streamlit dashboard for visual monitoring
 ├── telegram_bot.py    # Telegram bot interface (optional)
-├── main.py            # Alternative entry with Telegram bot integration
+├── main.py            # Primary entry: autonomous loop + Telegram bot (15min cycles)
+├── deploy.sh          # Conway sandbox deployment script
 ├── demo/              # Seed data for dashboard (works without API keys)
 ├── tests/
-│   └── test_core.py   # 97 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
+│   └── test_core.py   # 102 tests: bridge cost, yield filter, brain parsing, wallet, security, swaps, telegram
 ├── requirements.txt   # Python dependencies
 └── .env.template      # Environment variable template
 ```
