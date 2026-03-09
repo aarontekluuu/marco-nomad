@@ -174,9 +174,34 @@ async def decide(
             flags.append("✓ trusted")
         if opp.get("_multi_asset"):
             flags.append("LP pair")
+        if opp.get("_risk_score") is not None:
+            flags.append(f"risk:{opp['_risk_score']}/100")
+        if opp.get("_protocol_age_days") is not None:
+            flags.append(f"age:{opp['_protocol_age_days']}d")
+        if opp.get("_audited"):
+            flags.append("audited")
         if flags:
             line += f" | {' '.join(flags)}"
         context_parts.append(line)
+
+    # AAR-86: Show active limit orders for brain context
+    try:
+        from wallet import load_state, get_limits
+        _state = load_state()
+        _limits = get_limits(_state)
+        if _limits:
+            context_parts.append("\n## Active Limit Orders")
+            for i, lim in enumerate(_limits):
+                desc = f" — {lim.get('description', '')}" if lim.get("description") else ""
+                context_parts.append(
+                    f"- {lim['chain']} min APY: {lim['min_apy']:.1f}%{desc}"
+                )
+            context_parts.append(
+                "Consider these limits when deciding. If an opportunity matches a limit order "
+                "(chain matches AND APY >= min_apy), prioritize it."
+            )
+    except Exception:
+        pass  # Don't crash brain if limit loading fails
 
     if recent_journal:
         context_parts.append("\n## Recent Journal Entries")

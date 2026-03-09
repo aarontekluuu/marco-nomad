@@ -10,3 +10,4 @@ __pycache__/
 wallet_state.json
 journal.json
 wallet.json
+yields.db

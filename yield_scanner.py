@@ -5,6 +5,26 @@ import time
 
 import httpx
 
+# Protocol metadata cache (DefiLlama /protocols endpoint)
+_protocol_cache: dict = {}
+_protocol_cache_ts: float = 0
+
+
+async def fetch_protocol_info(client: httpx.AsyncClient, project: str) -> dict | None:
+    """Fetch protocol info from DefiLlama. Cached for 1 hour."""
+    global _protocol_cache, _protocol_cache_ts
+    if _protocol_cache and (time.time() - _protocol_cache_ts) < 3600:
+        return _protocol_cache.get(project)
+    try:
+        resp = await client.get("https://api.llama.fi/protocols", timeout=15)
+        resp.raise_for_status()
+        protocols = resp.json()
+        _protocol_cache = {p.get("slug", ""): p for p in protocols}
+        _protocol_cache_ts = time.time()
+        return _protocol_cache.get(project)
+    except Exception:
+        return None
+
 POOLS_URL = "https://yields.llama.fi/pools"
 
 # Cache to avoid re-fetching 5-10MB pool data every cycle
@@ -68,6 +88,31 @@ TRUSTED_PROTOCOLS = {
 
 # Max ratio of current APY to 30-day average before flagging as suspicious spike
 MAX_APY_SPIKE_RATIO = 5.0
+
+
+def calc_risk_score(pool: dict) -> int:
+    """Calculate 0-100 risk score (higher = safer)."""
+    score = 0
+    # TVL (30 points)
+    tvl = pool.get("tvlUsd", 0)
+    if tvl > 100_000_000: score += 30
+    elif tvl > 10_000_000: score += 25
+    elif tvl > 1_000_000: score += 15
+    elif tvl > 500_000: score += 5
+    # Protocol trust (20 points)
+    if pool.get("_trusted"): score += 20
+    # APY stability (20 points) - closer to 30d avg = more stable
+    apy = pool.get("apy", 0)
+    mean30d = pool.get("apyMean30d", 0)
+    if mean30d > 0:
+        ratio = apy / mean30d
+        if 0.8 <= ratio <= 1.2: score += 20
+        elif 0.5 <= ratio <= 2.0: score += 10
+    # Not an outlier (15 points)
+    if not pool.get("outlier"): score += 15
+    # No IL risk (15 points)
+    if pool.get("ilRisk") != "yes": score += 15
+    return min(score, 100)
 
 
 def filter_pools(
@@ -135,6 +180,22 @@ def filter_pools(
         # Flag pools with single-asset exposure risk (e.g. "multi" exposure = LP pair)
         exposure = (p.get("exposure") or "").lower()
         p["_multi_asset"] = exposure == "multi"
+
+        # Protocol age/audit from DefiLlama protocol cache (AAR-81)
+        proto_info = _protocol_cache.get(project) if _protocol_cache else None
+        if proto_info:
+            listed_at = proto_info.get("listedAt")
+            if listed_at:
+                p["_protocol_age_days"] = int((time.time() - listed_at) / 86400)
+            else:
+                p["_protocol_age_days"] = None
+            p["_audited"] = bool(proto_info.get("audits") or proto_info.get("audit_links"))
+        else:
+            p["_protocol_age_days"] = None
+            p["_audited"] = None
+
+        # Risk score (AAR-92)
+        p["_risk_score"] = calc_risk_score(p)
 
         filtered.append(p)
 

@@ -1,5 +1,8 @@
 """LI.FI API module - cross-chain quotes, cost calc, route execution."""
 
+import asyncio
+import json
+
 import httpx
 
 BASE = "https://li.quest/v1"
@@ -38,6 +41,30 @@ async def get_quote(
     resp = await client.get(f"{BASE}/quote", headers=_headers(api_key), params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+async def get_quotes_multi(client, from_chain, to_chain, from_token, to_token, from_amount, from_address, slippage=0.005, api_key=None) -> list[dict]:
+    """Fetch quotes with different order preferences and return all."""
+    tasks = []
+    for order in ("RECOMMENDED", "CHEAPEST", "FASTEST"):
+        params = {
+            "fromChain": from_chain, "toChain": to_chain,
+            "fromToken": from_token, "toToken": to_token,
+            "fromAmount": from_amount, "fromAddress": from_address,
+            "slippage": slippage, "order": order,
+        }
+        tasks.append(client.get(f"{BASE}/quote", headers=_headers(api_key), params=params, timeout=30))
+    results = []
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    for resp in responses:
+        if isinstance(resp, Exception):
+            continue
+        try:
+            resp.raise_for_status()
+            results.append(resp.json())
+        except Exception:
+            continue
+    return results
 
 
 async def check_status(
@@ -376,3 +403,35 @@ RPC_URLS = {
 }
 
 
+async def get_quote_with_deposit(
+    client: httpx.AsyncClient,
+    from_chain: int, to_chain: int,
+    from_token: str, to_token: str,
+    from_amount: str, from_address: str,
+    deposit_contract: str | None = None,
+    deposit_calldata: str | None = None,
+    slippage: float = 0.005, api_key: str | None = None,
+) -> dict:
+    """Get a quote that includes a contract call on the destination chain.
+
+    If deposit_contract and deposit_calldata are provided, LI.FI will
+    bridge + execute the deposit in a single TX (atomic bridge+deposit).
+    """
+    params = {
+        "fromChain": from_chain, "toChain": to_chain,
+        "fromToken": from_token, "toToken": to_token,
+        "fromAmount": from_amount, "fromAddress": from_address,
+        "slippage": slippage, "order": "RECOMMENDED",
+    }
+    if deposit_contract and deposit_calldata:
+        # LI.FI contractCalls feature
+        params["contractCalls"] = json.dumps([{
+            "sendingAmount": from_amount,
+            "receivingAmount": "0",
+            "toContractAddress": deposit_contract,
+            "toContractCallData": deposit_calldata,
+            "toContractGasLimit": "200000",
+        }])
+    resp = await client.get(f"{BASE}/quote", headers=_headers(api_key), params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()

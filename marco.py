@@ -37,6 +37,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.6"))
 
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
 JOURNAL_FILE = Path(__file__).parent / "journal.json"
 MAX_JOURNAL_ENTRIES = 100
 
@@ -81,6 +83,15 @@ async def send_telegram(client: httpx.AsyncClient, message: str):
         log(f"Telegram send failed: {e}")
 
 
+async def send_webhook(client: httpx.AsyncClient, payload: dict):
+    if not WEBHOOK_URL:
+        return
+    try:
+        await client.post(WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:
+        log(f"Webhook failed: {e}")
+
+
 def log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
@@ -119,6 +130,16 @@ async def _run_cycle_inner():
     if pool:
         log(f"Pool: {pool.get('symbol','?')} ({pool.get('project','?')}) — {pool.get('apy',0):.1f}% APY")
 
+    # AAR-100: Load strategy profile and apply to scan params
+    strategy_name = wallet.get_strategy(state)
+    strategy = wallet.STRATEGY_PROFILES.get(strategy_name, wallet.STRATEGY_PROFILES["balanced"])
+    scan_min_tvl = strategy.get("min_tvl", MIN_TVL)
+    scan_min_apy = strategy.get("min_apy", MIN_APY)
+    bridge_cost_cap = strategy.get("max_bridge_cost_pct", MAX_BRIDGE_COST_PCT)
+    confidence_gate = strategy.get("min_confidence", MIN_CONFIDENCE)
+    trusted_only = strategy.get("trusted_only", False)
+    log(f"Strategy: {strategy_name}")
+
     # SAFETY: Check for pending TX from a previous crash
     pending = state.get("_pending_tx")
     if pending:
@@ -145,8 +166,17 @@ async def _run_cycle_inner():
         # 1. Scan yields
         log("Scanning yields...")
         candidates = await yield_scanner.scan_yields(
-            client, chains=SCAN_CHAINS, min_tvl=MIN_TVL, min_apy=MIN_APY
+            client, chains=SCAN_CHAINS, min_tvl=scan_min_tvl, min_apy=scan_min_apy
         )
+        # AAR-100: Filter to trusted protocols only if strategy requires it
+        if trusted_only:
+            candidates = [p for p in candidates if p.get("_trusted")]
+
+        try:
+            from yield_db import record_snapshot
+            record_snapshot(candidates)
+        except Exception:
+            pass  # Non-critical
 
         if not candidates:
             log("No yields found matching criteria.")
@@ -165,6 +195,11 @@ async def _run_cycle_inner():
 
         bridge_quotes = {}  # quote_key -> {cost, quote, cost_pct, type}
 
+        # AAR-95: Adaptive slippage based on position vs pool liquidity
+        avg_tvl = sum(p.get("tvlUsd", 0) for p in candidates[:5]) / max(len(candidates[:5]), 1)
+        adaptive_slip = wallet.calc_adaptive_slippage({"tvlUsd": avg_tvl}, position_usd)
+        effective_slippage = adaptive_slip if adaptive_slip != SLIPPAGE else SLIPPAGE
+
         # Resolve current token address + decimals
         current_stable = wallet.STABLECOINS.get((current_chain, current_token))
         current_token_addr = current_stable["address"] if current_stable else wallet.USDC.get(current_chain)
@@ -173,9 +208,23 @@ async def _run_cycle_inner():
         async def _fetch_quote(quote_key, from_chain, to_chain, from_token, to_token, from_decimals, move_type):
             amount_wei = str(int(position_usd * 10**from_decimals))
             try:
+                # AAR-90: Multi-route bridge comparison — try multiple routes for bridges
+                if move_type == "bridge":
+                    quotes = await lifi.get_quotes_multi(
+                        client, from_chain, to_chain, from_token, to_token,
+                        amount_wei, wallet_addr, slippage=effective_slippage, api_key=LIFI_API_KEY,
+                    )
+                    if quotes:
+                        # Pick cheapest route
+                        best = min(quotes, key=lambda q: lifi.calc_bridge_cost(q)["total_cost_usd"])
+                        cost = lifi.calc_bridge_cost(best)
+                        cost_pct = (cost["total_cost_usd"] / position_usd * 100) if position_usd > 0 else 0
+                        bridge_quotes[quote_key] = {"cost": cost, "quote": best, "cost_pct": cost_pct, "type": move_type}
+                        return
+                # Fall through to single-quote logic (swaps, or if multi failed for bridges)
                 quote = await lifi.get_quote(
                     client, from_chain, to_chain, from_token, to_token,
-                    amount_wei, wallet_addr, slippage=SLIPPAGE, api_key=LIFI_API_KEY,
+                    amount_wei, wallet_addr, slippage=effective_slippage, api_key=LIFI_API_KEY,
                 )
                 cost = lifi.calc_bridge_cost(quote)
                 cost_pct = (cost["total_cost_usd"] / position_usd * 100) if position_usd > 0 else 0
@@ -229,8 +278,8 @@ async def _run_cycle_inner():
         for chain_name, qd in bridge_quotes.items():
             cost = qd["cost"]
             log(f"  -> {chain_name}: ${cost['total_cost_usd']:.2f} ({qd['cost_pct']:.2f}% of position) via {cost['bridge']}")
-            if qd["cost_pct"] > MAX_BRIDGE_COST_PCT:
-                log(f"     WARNING: exceeds {MAX_BRIDGE_COST_PCT}% threshold")
+            if qd["cost_pct"] > bridge_cost_cap:
+                log(f"     WARNING: exceeds {bridge_cost_cap}% threshold")
 
         # 3. Refresh current pool APY from live data (stored APY is from migration time)
         # Search ALL pools (not just filtered candidates) because the current pool's
@@ -298,7 +347,7 @@ async def _run_cycle_inner():
         result = await brain.decide(
             portfolio, candidates, journal_entries[-3:],
             current_pool=state.get("current_pool"),
-            bridge_cost_cap_pct=MAX_BRIDGE_COST_PCT,
+            bridge_cost_cap_pct=bridge_cost_cap,
         )
 
         journal_text = result["journal"]
@@ -321,8 +370,8 @@ async def _run_cycle_inner():
         save_journal(journal_entries)
 
         # 8. Execute moves if migrating (gate on confidence)
-        if decision.get("action") == "migrate" and decision.get("moves") and confidence < MIN_CONFIDENCE:
-            log(f"  BLOCKED: confidence {confidence:.0%} < {MIN_CONFIDENCE:.0%} threshold — holding instead")
+        if decision.get("action") == "migrate" and decision.get("moves") and confidence < confidence_gate:
+            log(f"  BLOCKED: confidence {confidence:.0%} < {confidence_gate:.0%} threshold — holding instead")
         elif decision.get("action") == "migrate" and decision.get("moves"):
             # Single-position model: only execute the first move
             for move in decision["moves"][:1]:
@@ -358,8 +407,8 @@ async def _run_cycle_inner():
                     quote_data = bridge_quotes.get(to_chain_name)
 
                 # Enforce bridge/swap cost threshold
-                if quote_data and quote_data["cost_pct"] > MAX_BRIDGE_COST_PCT:
-                    log(f"  BLOCKED: {to_chain_name} cost {quote_data['cost_pct']:.2f}% exceeds {MAX_BRIDGE_COST_PCT}% limit")
+                if quote_data and quote_data["cost_pct"] > bridge_cost_cap:
+                    log(f"  BLOCKED: {to_chain_name} cost {quote_data['cost_pct']:.2f}% exceeds {bridge_cost_cap}% limit")
                     continue
 
                 cost_usd = quote_data["cost"]["total_cost_usd"] if quote_data else 0
@@ -373,8 +422,17 @@ async def _run_cycle_inner():
                     log(f"  SAFETY BLOCK: {block_reason}")
                     continue
 
+                # AAR-85: TWAP execution — split large positions into chunks
+                use_twap = (
+                    wallet.TWAP_ENABLED
+                    and move_usd > wallet.TWAP_MIN_POSITION_USD
+                    and not DEMO_MODE
+                )
+
                 if DEMO_MODE:
                     log(f"  [DEMO] Would migrate to {to_chain_name} via LI.FI (cost: ${cost_usd:.2f})")
+                    if wallet.TWAP_ENABLED and move_usd > wallet.TWAP_MIN_POSITION_USD:
+                        log(f"  [DEMO] TWAP: would split into {wallet.TWAP_CHUNKS} chunks over {wallet.TWAP_CHUNKS * wallet.TWAP_INTERVAL_SECONDS}s")
                 else:
                     # Re-fetch quote right before execution — the original was fetched
                     # before brain.decide() which adds 5-30s of staleness
@@ -400,18 +458,38 @@ async def _run_cycle_inner():
                         fresh_quote = await lifi.get_quote(
                             client, current_chain, exec_to_chain,
                             exec_from_token, exec_to_token, amount_wei, wallet_addr,
-                            slippage=SLIPPAGE, api_key=LIFI_API_KEY,
+                            slippage=effective_slippage, api_key=LIFI_API_KEY,
                         )
                         fresh_cost = lifi.calc_bridge_cost(fresh_quote)
                         fresh_cost_pct = (fresh_cost["total_cost_usd"] / move_usd * 100) if move_usd > 0 else 0
-                        if fresh_cost_pct > MAX_BRIDGE_COST_PCT:
+                        if fresh_cost_pct > bridge_cost_cap:
                             log(f"  BLOCKED: fresh quote cost {fresh_cost_pct:.2f}% exceeds limit")
                             continue
+                        # AAR-83: Gas estimate vs position size validation
+                        # Abort if gas alone exceeds 5% of position
+                        gas_usd = fresh_cost.get("gas_usd", 0)
+                        if gas_usd > position_usd * 0.05:
+                            log(f"  ABORT: gas cost ${gas_usd:.4f} > 5% of position ${position_usd:.2f} (${position_usd * 0.05:.4f} limit)")
+                            continue
+
                         cost_usd = fresh_cost["total_cost_usd"]
                         log(f"  Fresh quote: ${cost_usd:.2f} ({fresh_cost.get('spread_usd', 0):.2f} spread) via {fresh_cost['bridge']}")
                     except Exception as e:
                         log(f"  Fresh quote failed ({e}), aborting migration to {to_chain_name}")
                         continue
+
+                    # AAR-80: Pre-TX on-chain balance verification
+                    # Prevents executing when tracked state diverges from reality
+                    pre_tx_rpc = lifi.RPC_URLS.get(current_chain)
+                    if pre_tx_rpc:
+                        on_chain_bal = await asyncio.to_thread(
+                            wallet.check_onchain_balance,
+                            current_chain, wallet_addr, pre_tx_rpc,
+                            token=current_token,
+                        )
+                        if on_chain_bal is not None and on_chain_bal < position_usd * 0.90:
+                            log(f"  ABORT: on-chain balance ${on_chain_bal:.2f} < 90% of position ${position_usd:.2f} — state diverged")
+                            continue
 
                     # Execute the bridge transaction on-chain
                     wallet_info = wallet.load_wallet()
@@ -427,63 +505,143 @@ async def _run_cycle_inner():
                         continue
                     log(f"  Executing {move_label} to {to_chain_name}...")
 
-                    # SAFETY: Record pending TX in state BEFORE execution.
-                    # If process crashes mid-bridge, this prevents double-spend on restart.
-                    state["_pending_tx"] = {
-                        "target_chain": target_chain_id,
-                        "target_pool_token": target_pool_token,
-                        "estimated_cost": cost_usd,
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                    wallet.save_state(state)
-
-                    try:
-                        tx_result = await lifi.execute_quote(
-                            fresh_quote, private_key, rpc_url,
-                            poll_status_client=client, api_key=LIFI_API_KEY,
-                        )
-                        log(f"  TX: {tx_result['tx_hash']} status={tx_result['status']}")
-                        if tx_result["status"] == "FAILED":
-                            log(f"  Bridge TX FAILED — not recording migration")
-                            state.pop("_pending_tx", None)
-                            wallet.save_state(state)
-                            continue
-                    except Exception as e:
-                        log(f"  Bridge execution failed: {e}")
+                    # AAR-89: Gas-aware execution — check gas price before TX
+                    gas_ok, gas_gwei = wallet.check_gas_price(current_chain, rpc_url)
+                    if not gas_ok:
+                        log(f"  ABORT: Gas price {gas_gwei:.2f} gwei exceeds threshold — delaying migration")
                         state.pop("_pending_tx", None)
                         wallet.save_state(state)
                         continue
 
-                    # Handle PENDING status (polling timed out — bridge may still land)
-                    if tx_result["status"] == "PENDING":
-                        log(f"  WARNING: Bridge status still PENDING after polling timeout. TX: {tx_result['tx_hash']}")
-                        log(f"  Funds may be in transit. Recording migration with estimated cost — reconcile will correct next cycle.")
-                        # Record with estimate — reconcile_balance will fix on next cycle
-                        state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+                    # AAR-85: TWAP execution — split into chunks for large positions
+                    if use_twap:
+                        num_chunks = wallet.TWAP_CHUNKS
+                        chunk_amount = move_usd / num_chunks
+                        total_twap_cost = 0.0
+                        twap_failed = False
+                        log(f"  TWAP: splitting ${move_usd:.2f} into {num_chunks} chunks of ${chunk_amount:.2f}")
 
-                    # Verify received amount on destination chain (only for DONE status)
-                    elif tx_result["status"] == "DONE":
-                        dest_rpc = lifi.RPC_URLS.get(target_chain_id)
-                        if dest_rpc:
-                            # Check balance of the token we're landing in
-                            dest_token = target_pool_token if is_swap else "USDC"
-                            actual = await asyncio.to_thread(
-                                wallet.check_onchain_balance,
-                                target_chain_id, wallet_addr, dest_rpc,
-                                token=dest_token,
+                        for chunk_i in range(num_chunks):
+                            log(f"  TWAP chunk {chunk_i + 1}/{num_chunks}: ${chunk_amount:.2f}")
+                            # Get fresh quote for this chunk
+                            chunk_wei = str(int(chunk_amount * 10**current_token_decimals))
+                            try:
+                                chunk_quote = await lifi.get_quote(
+                                    client, current_chain, exec_to_chain,
+                                    exec_from_token, exec_to_token, chunk_wei, wallet_addr,
+                                    slippage=effective_slippage, api_key=LIFI_API_KEY,
+                                )
+                                chunk_cost_info = lifi.calc_bridge_cost(chunk_quote)
+                                chunk_cost = chunk_cost_info["total_cost_usd"]
+                            except Exception as e:
+                                log(f"  TWAP chunk {chunk_i + 1} quote failed: {e} — stopping TWAP")
+                                twap_failed = True
+                                break
+
+                            # Record pending and execute
+                            state["_pending_tx"] = {
+                                "target_chain": target_chain_id,
+                                "target_pool_token": target_pool_token,
+                                "estimated_cost": chunk_cost,
+                                "timestamp": datetime.now().isoformat(),
+                                "twap_chunk": chunk_i + 1,
+                            }
+                            wallet.save_state(state)
+
+                            try:
+                                chunk_result = await lifi.execute_quote(
+                                    chunk_quote, private_key, rpc_url,
+                                    poll_status_client=client, api_key=LIFI_API_KEY,
+                                )
+                                log(f"  TWAP chunk {chunk_i + 1} TX: {chunk_result['tx_hash']} status={chunk_result['status']}")
+                                if chunk_result["status"] == "FAILED":
+                                    log(f"  TWAP chunk {chunk_i + 1} FAILED — stopping TWAP")
+                                    twap_failed = True
+                                    state.pop("_pending_tx", None)
+                                    wallet.save_state(state)
+                                    break
+                            except Exception as e:
+                                log(f"  TWAP chunk {chunk_i + 1} execution failed: {e} — stopping TWAP")
+                                twap_failed = True
+                                state.pop("_pending_tx", None)
+                                wallet.save_state(state)
+                                break
+
+                            total_twap_cost += chunk_cost
+                            state["position_usd"] = round(state["position_usd"] - chunk_cost, 2)
+                            state.pop("_pending_tx", None)
+                            wallet.save_state(state)
+                            log(f"  TWAP chunk {chunk_i + 1} complete (cost: ${chunk_cost:.2f})")
+
+                            # Wait between chunks (except after the last one)
+                            if chunk_i < num_chunks - 1:
+                                log(f"  TWAP: waiting {wallet.TWAP_INTERVAL_SECONDS}s before next chunk...")
+                                await asyncio.sleep(wallet.TWAP_INTERVAL_SECONDS)
+
+                        cost_usd = total_twap_cost
+                        if twap_failed:
+                            log(f"  TWAP stopped early — completed {chunk_i}/{num_chunks} chunks, total cost: ${total_twap_cost:.2f}")
+                            # Still record partial migration below
+
+                    else:
+                        # Standard (non-TWAP) execution
+                        # SAFETY: Record pending TX in state BEFORE execution.
+                        # If process crashes mid-bridge, this prevents double-spend on restart.
+                        state["_pending_tx"] = {
+                            "target_chain": target_chain_id,
+                            "target_pool_token": target_pool_token,
+                            "estimated_cost": cost_usd,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                        wallet.save_state(state)
+
+                        try:
+                            tx_result = await lifi.execute_quote(
+                                fresh_quote, private_key, rpc_url,
+                                poll_status_client=client, api_key=LIFI_API_KEY,
                             )
-                            if actual is not None:
-                                expected_min = fresh_cost["to_amount_min"]
-                                if actual < expected_min * 0.95:
-                                    log(f"  WARNING: received ${actual:.2f} < expected min ${expected_min:.2f}")
+                            log(f"  TX: {tx_result['tx_hash']} status={tx_result['status']}")
+                            if tx_result["status"] == "FAILED":
+                                log(f"  Bridge TX FAILED — not recording migration")
+                                state.pop("_pending_tx", None)
+                                wallet.save_state(state)
+                                continue
+                        except Exception as e:
+                            log(f"  Bridge execution failed: {e}")
+                            state.pop("_pending_tx", None)
+                            wallet.save_state(state)
+                            continue
+
+                        # Handle PENDING status (polling timed out — bridge may still land)
+                        if tx_result["status"] == "PENDING":
+                            log(f"  WARNING: Bridge status still PENDING after polling timeout. TX: {tx_result['tx_hash']}")
+                            log(f"  Funds may be in transit. Recording migration with estimated cost — reconcile will correct next cycle.")
+                            # Record with estimate — reconcile_balance will fix on next cycle
+                            state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
+
+                        # Verify received amount on destination chain (only for DONE status)
+                        elif tx_result["status"] == "DONE":
+                            dest_rpc = lifi.RPC_URLS.get(target_chain_id)
+                            if dest_rpc:
+                                # Check balance of the token we're landing in
+                                dest_token = target_pool_token if is_swap else "USDC"
+                                actual = await asyncio.to_thread(
+                                    wallet.check_onchain_balance,
+                                    target_chain_id, wallet_addr, dest_rpc,
+                                    token=dest_token,
+                                )
+                                if actual is not None:
+                                    expected_min = fresh_cost["to_amount_min"]
+                                    if actual < expected_min * 0.95:
+                                        log(f"  WARNING: received ${actual:.2f} < expected min ${expected_min:.2f}")
+                                    else:
+                                        log(f"  Verified: ${actual:.2f} received on {to_chain_name}")
+                                    state["position_usd"] = round(actual, 2)
+                                    cost_usd = round(move_usd - actual, 2)
                                 else:
-                                    log(f"  Verified: ${actual:.2f} received on {to_chain_name}")
-                                state["position_usd"] = round(actual, 2)
-                                cost_usd = round(move_usd - actual, 2)
+                                    state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
                             else:
                                 state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
-                        else:
-                            state["position_usd"] = round(state["position_usd"] - cost_usd, 2)
 
                 if DEMO_MODE:
                     # DEMO: simulate cost deduction
@@ -503,6 +661,16 @@ async def _run_cycle_inner():
             f"Action: *{decision.get('action', 'hold').upper()}*"
         )
         await send_telegram(client, telegram_msg)
+
+        # 10. Webhook notification
+        await send_webhook(client, {
+            "timestamp": datetime.now().isoformat(),
+            "action": decision.get("action", "hold"),
+            "confidence": decision.get("confidence", 0.5),
+            "journal": journal_text,
+            "position_usd": state.get("position_usd", 0),
+            "chain": CHAIN_MAP.get(state.get("current_chain", 8453), "?"),
+        })
 
 
 async def main():

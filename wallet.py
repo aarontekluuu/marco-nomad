@@ -18,6 +18,16 @@ MAX_MIGRATIONS = 200  # Cap migration history to prevent wallet_state.json bloat
 MAX_TX_VALUE_USD = 50.0  # SAFETY: Hard cap on single TX value — prevents draining wallet
 MAX_DAILY_BRIDGE_COST_USD = 5.0  # SAFETY: Max cumulative bridge costs per 24h
 
+# TWAP execution config
+TWAP_ENABLED = os.getenv("TWAP_ENABLED", "false").lower() == "true"
+TWAP_CHUNKS = int(os.getenv("TWAP_CHUNKS", "3"))
+TWAP_INTERVAL_SECONDS = int(os.getenv("TWAP_INTERVAL", "600"))  # 10min between chunks
+TWAP_MIN_POSITION_USD = 50.0  # Only TWAP for positions above this
+
+# Stop-loss config
+STOP_LOSS_CYCLES = int(os.getenv("STOP_LOSS_CYCLES", "3"))
+STOP_LOSS_ENABLED = os.getenv("STOP_LOSS_ENABLED", "true").lower() == "true"
+
 # Well-known USDC addresses per chain (must match yield_scanner.CHAIN_MAP)
 USDC = {
     1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",       # Ethereum
@@ -62,6 +72,68 @@ STABLECOINS = {
 
 # Which stablecoin symbols Marco can swap into (all pegged to $1)
 ALLOWED_STABLES = {"USDC", "USDT", "DAI", "USDbC", "USDC.e", "FRAX", "LUSD", "GHO", "PYUSD", "crvUSD"}
+
+
+# --- AAR-89: Gas-aware execution ---
+MAX_GAS_GWEI_L1 = float(os.getenv("MAX_GAS_GWEI_L1", "30"))
+MAX_GAS_GWEI_L2 = float(os.getenv("MAX_GAS_GWEI_L2", "0.5"))
+L2_CHAINS = {8453, 42161, 10, 137, 324, 59144, 534352}
+
+
+def check_gas_price(chain_id: int, rpc_url: str) -> tuple[bool, float]:
+    """Check if gas price is acceptable. Returns (ok, current_gwei)."""
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        gas_price = w3.eth.gas_price
+        gwei = gas_price / 1e9
+        max_gwei = MAX_GAS_GWEI_L2 if chain_id in L2_CHAINS else MAX_GAS_GWEI_L1
+        return gwei <= max_gwei, gwei
+    except Exception:
+        return True, 0  # Fail-open on gas check failure
+
+
+# --- AAR-95: Adaptive slippage ---
+def calc_adaptive_slippage(pool: dict, position_usd: float) -> float:
+    """Calculate slippage based on pool liquidity and position size."""
+    tvl = pool.get("tvlUsd", 0)
+    ratio = position_usd / tvl if tvl > 0 else 1.0
+    if ratio < 0.0001:  # < 0.01% of pool TVL
+        return 0.001  # 0.1% - very tight
+    elif ratio < 0.001:  # < 0.1% of pool TVL
+        return 0.003  # 0.3%
+    elif ratio < 0.01:  # < 1% of pool TVL
+        return 0.005  # 0.5% - default
+    else:
+        return 0.01  # 1% - wider for large positions relative to pool
+
+
+# --- AAR-100: Strategy profiles ---
+STRATEGY_PROFILES = {
+    "conservative": {
+        "min_tvl": 10_000_000, "min_apy": 2.0, "max_bridge_cost_pct": 1.0,
+        "min_confidence": 0.8, "trusted_only": True, "description": "Trusted protocols only, high TVL, low risk"
+    },
+    "balanced": {
+        "min_tvl": 500_000, "min_apy": 3.0, "max_bridge_cost_pct": 2.0,
+        "min_confidence": 0.6, "trusted_only": False, "description": "Default — moderate risk/reward"
+    },
+    "aggressive": {
+        "min_tvl": 100_000, "min_apy": 5.0, "max_bridge_cost_pct": 3.0,
+        "min_confidence": 0.4, "trusted_only": False, "description": "Higher APY chase, lower thresholds"
+    },
+}
+
+
+def get_strategy(state: dict) -> str:
+    return state.get("_strategy", "balanced")
+
+
+def set_strategy(state: dict, profile: str):
+    if profile not in STRATEGY_PROFILES:
+        raise ValueError(f"Unknown strategy: {profile}. Options: {', '.join(STRATEGY_PROFILES)}")
+    state["_strategy"] = profile
+    save_state(state)
 
 
 def validate_private_key(private_key: str) -> tuple[bool, str, str]:
@@ -530,6 +602,146 @@ def reconcile_balance(state: dict, rpc_url: str) -> float | None:
         state.pop("_drift_alert", None)  # Clear any previous alert
         save_state(state)
     return drift
+
+
+def get_limits(state: dict) -> list[dict]:
+    """Get active limit orders."""
+    return state.get("_limits", [])
+
+
+def add_limit(state: dict, chain: str, min_apy: float, description: str = ""):
+    """Add a limit order that triggers when a chain's APY exceeds min_apy."""
+    limits = state.get("_limits", [])
+    limits.append({
+        "chain": chain,
+        "min_apy": min_apy,
+        "description": description,
+        "created": datetime.now().isoformat(),
+    })
+    state["_limits"] = limits
+    save_state(state)
+
+
+def remove_limit(state: dict, index: int):
+    """Remove a limit order by index."""
+    limits = state.get("_limits", [])
+    if 0 <= index < len(limits):
+        limits.pop(index)
+        state["_limits"] = limits
+        save_state(state)
+
+
+def check_stop_loss(state: dict, current_apy: float, min_apy: float) -> bool:
+    """Track consecutive below-threshold cycles. Returns True if stop-loss triggered."""
+    if not STOP_LOSS_ENABLED:
+        return False
+    if current_apy >= min_apy:
+        state["_stop_loss_count"] = 0
+        return False
+    count = state.get("_stop_loss_count", 0) + 1
+    state["_stop_loss_count"] = count
+    return count >= STOP_LOSS_CYCLES
+
+
+def calc_pnl(state: dict) -> dict:
+    """Calculate realized PnL from migration history."""
+    migrations = state.get("migrations", [])
+    total_costs = sum(m.get("cost_usd", 0) for m in migrations)
+    initial = float(os.getenv("POSITION_SIZE_USD", "10"))
+    current = state.get("position_usd", 0)
+    # Yield earned = current_position + total_costs - initial
+    # (costs were deducted from position, so add them back to see gross)
+    gross_yield = current + total_costs - initial
+    net_pnl = current - initial
+    roi_pct = (net_pnl / initial * 100) if initial > 0 else 0
+    return {
+        "initial": initial,
+        "current": current,
+        "total_costs": total_costs,
+        "gross_yield": gross_yield,
+        "net_pnl": net_pnl,
+        "roi_pct": roi_pct,
+        "num_migrations": len(migrations),
+    }
+
+
+def get_positions(state: dict) -> list[dict]:
+    """Get all positions. Currently single-position, but schema supports multiple."""
+    positions = state.get("_positions", [])
+    if not positions:
+        # Backwards compat: derive from legacy single-position state
+        return [{
+            "chain_id": state.get("current_chain", 8453),
+            "token": state.get("current_token", "USDC"),
+            "amount_usd": state.get("position_usd", 0),
+            "pool": state.get("current_pool"),
+        }]
+    return positions
+
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+
+# DCA mode
+DCA_ENABLED = os.getenv("DCA_ENABLED", "false").lower() == "true"
+DCA_CHUNKS = int(os.getenv("DCA_CHUNKS", "3"))
+
+def get_dca_state(state: dict) -> dict | None:
+    """Get active DCA state if DCA is in progress."""
+    return state.get("_dca")
+
+def start_dca(state: dict, target_chain: str, total_chunks: int = DCA_CHUNKS):
+    state["_dca"] = {
+        "target_chain": target_chain,
+        "total_chunks": total_chunks,
+        "completed_chunks": 0,
+        "started_at": datetime.now().isoformat(),
+    }
+    save_state(state)
+
+def advance_dca(state: dict) -> bool:
+    """Advance DCA by one chunk. Returns True if DCA is complete."""
+    dca = state.get("_dca")
+    if not dca:
+        return True
+    dca["completed_chunks"] += 1
+    if dca["completed_chunks"] >= dca["total_chunks"]:
+        state.pop("_dca", None)
+        save_state(state)
+        return True
+    save_state(state)
+    return False
+
+# Auto-compound
+COMPOUND_ENABLED = os.getenv("COMPOUND_ENABLED", "false").lower() == "true"
+
+# Protocol reward token claim ABIs — extend as protocols are supported
+COMPOUND_PROTOCOLS = {
+    "aave-v3": {
+        "description": "Claim AAVE rewards via IncentivesController",
+        "supported": False,  # TODO: implement claim ABI
+    },
+    "moonwell": {
+        "description": "Claim WELL rewards",
+        "supported": False,
+    },
+}
+
+def get_compound_status() -> dict:
+    """Return which protocols support auto-compound."""
+    return {k: v for k, v in COMPOUND_PROTOCOLS.items()}
+
+
+# --- AAR-97: Multi-chain balance view ---
+def check_all_chain_balances(wallet_address: str) -> dict[str, float]:
+    """Check USDC balance on all supported chains. Returns {chain_name: balance_usd}."""
+    from lifi import RPC_URLS
+    from yield_scanner import CHAIN_MAP
+    balances = {}
+    for chain_id, rpc_url in RPC_URLS.items():
+        chain_name = CHAIN_MAP.get(chain_id, f"Chain {chain_id}")
+        bal = check_onchain_balance(chain_id, wallet_address, rpc_url)
+        if bal is not None and bal > 0.01:
+            balances[chain_name] = round(bal, 2)
+    return balances
 
 
 def format_state(state: dict) -> str:
