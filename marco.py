@@ -42,6 +42,7 @@ DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.6"))
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+QUIET_CYCLES = int(os.getenv("QUIET_CYCLES", "4"))  # Force broadcast after N silent cycles
 
 JOURNAL_FILE = Path(__file__).parent / "journal.json"
 MAX_JOURNAL_ENTRIES = 100
@@ -116,6 +117,116 @@ def _banner():
     print()
 
 
+# Journal dedup state (in-memory, resets on restart)
+_last_broadcast = {"sig": "", "quiet_count": 0}
+
+
+async def _try_initial_deposit(state, candidates):
+    """If position exists but not deposited in any pool, deposit into best available."""
+    current_chain = state["current_chain"]
+    current_token = state.get("current_token", "USDC")
+    position_usd = state.get("position_usd", 0)
+    wallet_addr = state.get("address", "")
+    chain_name = CHAIN_MAP.get(current_chain, "?")
+
+    protocols.ensure_loaded()
+
+    # Find best candidate on current chain with a working adapter
+    best_pool = None
+    best_adapter = None
+    for pool in candidates:
+        if pool.get("chain") != chain_name:
+            continue
+        project = (pool.get("project") or "").lower()
+        adapter = protocols.get_adapter(project)
+        if adapter and adapter.supports_chain(current_chain):
+            best_pool = pool
+            best_adapter = adapter
+            break  # candidates are already sorted by APY
+
+    if not best_pool or not best_adapter:
+        # Fallback: directly pick the first adapter that supports this chain
+        # Earning 2-4% in Aave/Moonwell is better than earning 0%
+        log("  No depositable pool in candidates — using direct adapter fallback...")
+        for slug, adapter in protocols.list_adapters().items():
+            if adapter.supports_chain(current_chain):
+                best_adapter = adapter
+                best_pool = {
+                    "project": slug,
+                    "symbol": current_token,
+                    "chain": chain_name,
+                    "apy": 0,  # Unknown until deposited — will update next cycle
+                }
+                log(f"  Fallback: {slug} supports {chain_name}")
+                break
+
+    if not best_pool or not best_adapter:
+        log("  No depositable pool found on current chain — funds idle")
+        return
+
+    project = (best_pool.get("project") or "").lower()
+    apy = best_pool.get("apy", 0)
+    log(f"  Initial deposit: {project} on {chain_name} at {apy:.1f}% APY")
+
+    try:
+        rpc_url = lifi.RPC_URLS.get(current_chain)
+        if not rpc_url:
+            log(f"  No RPC URL for chain {current_chain}")
+            return
+
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        wallet_info = wallet.load_wallet()
+        if not wallet_info:
+            log("  No wallet configured — cannot deposit")
+            return
+
+        stable = wallet.STABLECOINS.get((current_chain, current_token))
+        token_addr = stable["address"] if stable else wallet.USDC.get(current_chain)
+        decimals = stable["decimals"] if stable else wallet.USDC_DECIMALS
+
+        if not token_addr:
+            log(f"  No token address for {current_token} on chain {current_chain}")
+            return
+
+        deposit_amount_raw = int(position_usd * 10**decimals)
+
+        dep_result = await best_adapter.deposit(
+            w3, deposit_amount_raw, token_addr,
+            wallet_addr, wallet_info[1], current_chain,
+        )
+        log(f"  Deposited ${dep_result.amount_deposited:.2f} into {project}: TX {dep_result.tx_hash[:16]}...")
+
+        # Verify deposit landed on-chain before recording state
+        ok, actual, vmsg = await best_adapter.verify_deposit(
+            w3, wallet_addr, current_chain, dep_result.amount_deposited
+        )
+        if not ok:
+            log(f"  VERIFY FAILED: {vmsg} — not recording as deposited")
+            return
+        log(f"  {vmsg}")
+
+        state["_deposited_pool"] = {
+            "protocol": project,
+            "pool_address": best_adapter.POOL_ADDRESSES.get(current_chain, ""),
+            "receipt_token": dep_result.receipt_token,
+            "deposited_amount": actual,  # Use on-chain verified amount
+            "deposited_at": datetime.now().isoformat(),
+            "chain_id": current_chain,
+        }
+        state["current_pool"] = {
+            "pool_id": best_pool.get("pool"),
+            "symbol": best_pool.get("symbol"),
+            "project": best_pool.get("project"),
+            "chain": best_pool.get("chain"),
+            "apy": best_pool.get("apy"),
+        }
+        wallet.save_state(state)
+    except Exception as e:
+        log(f"  Initial deposit failed: {e}")
+
+
 _cycle_lock = asyncio.Lock()
 
 
@@ -148,6 +259,14 @@ async def _run_cycle_inner():
     trusted_only = strategy.get("trusted_only", False)
     log(f"Strategy: {strategy_name}")
 
+    # SAFETY: If position_usd is 0 but we have a deposited pool, restore from deposit amount
+    deposited = state.get("_deposited_pool")
+    if state.get("position_usd", 0) <= 0 and deposited and deposited.get("deposited_amount", 0) > 0:
+        restored = deposited["deposited_amount"]
+        log(f"  RECOVERY: position_usd was $0 with active deposit — restoring to ${restored:.2f}")
+        state["position_usd"] = restored
+        wallet.save_state(state)
+
     # SAFETY: Check for pending TX from a previous crash
     pending = state.get("_pending_tx")
     if pending:
@@ -162,13 +281,36 @@ async def _run_cycle_inner():
             f"on-chain ${drift_alert.get('on_chain', '?')} vs tracked ${drift_alert.get('tracked', '?')}")
 
     # Reconcile tracked balance with on-chain reality (LIVE mode only)
-    # Run in thread to avoid blocking the event loop (web3 calls are sync)
+    # If deposited in a pool, check the pool balance instead of raw USDC
     if not DEMO_MODE:
-        rpc_url = lifi.RPC_URLS.get(state["current_chain"])
-        if rpc_url:
-            drift = await asyncio.to_thread(wallet.reconcile_balance, state, rpc_url)
-            if drift is not None and abs(drift) > 0.01:
-                log(f"Balance reconciled: drift was ${drift:+.2f} (now ${state['position_usd']:.2f})")
+        deposited = state.get("_deposited_pool")
+        if deposited:
+            # Check balance via protocol adapter (includes accrued yield)
+            try:
+                protocols.ensure_loaded()
+                adapter = protocols.get_adapter(deposited.get("protocol", ""))
+                if adapter:
+                    rpc_url = lifi.RPC_URLS.get(state["current_chain"])
+                    if rpc_url:
+                        from web3 import Web3
+                        w3 = Web3(Web3.HTTPProvider(rpc_url))
+                        pool_bal = await adapter.balance(
+                            w3, state.get("address", ""), state["current_chain"]
+                        )
+                        if pool_bal is not None and pool_bal > 0:
+                            old = state["position_usd"]
+                            state["position_usd"] = round(pool_bal, 4)
+                            if abs(pool_bal - old) > 0.001:
+                                log(f"Pool balance: ${pool_bal:.4f} (was ${old:.2f}, yield: ${pool_bal - old:+.4f})")
+                            wallet.save_state(state)
+            except Exception as e:
+                log(f"Pool balance check failed: {e}")
+        else:
+            rpc_url = lifi.RPC_URLS.get(state["current_chain"])
+            if rpc_url:
+                drift = await asyncio.to_thread(wallet.reconcile_balance, state, rpc_url)
+                if drift is not None and abs(drift) > 0.01:
+                    log(f"Balance reconciled: drift was ${drift:+.2f} (now ${state['position_usd']:.2f})")
 
     async with httpx.AsyncClient() as client:
         # 1. Scan yields
@@ -321,7 +463,11 @@ async def _run_cycle_inner():
                 if abs(old_apy - new_apy) > 0.1:
                     log(f"  Current pool APY updated: {old_apy:.2f}% -> {new_apy:.2f}% (live)")
                 current_pool["apy"] = new_apy
+                # Also capture pool_id if missing (Bug: initial deposit didn't save it)
+                if not current_pool.get("pool_id") and live_match.get("pool"):
+                    current_pool["pool_id"] = live_match["pool"]
                 state["current_pool"] = current_pool
+                wallet.save_state(state)
 
         # 4. Enrich candidates with bridge/swap cost data for brain
         current_chain_name = CHAIN_MAP.get(current_chain, "")
@@ -370,6 +516,60 @@ async def _run_cycle_inner():
         except Exception as e:
             log(f"  Yield trend lookup failed: {e}")
 
+        # 4c. Flag depositable pools (have protocol adapter on their chain)
+        protocols.ensure_loaded()
+        for pool in candidates:
+            pool_project = (pool.get("project") or "").lower()
+            pool_chain_name = pool.get("chain", "")
+            pool_chain_id = CHAIN_MAP_REVERSE.get(pool_chain_name, 0)
+            adapter = protocols.get_adapter(pool_project)
+            pool["_depositable"] = bool(adapter and adapter.supports_chain(pool_chain_id))
+
+        # Filter to depositable pools only — no point showing the brain pools
+        # Marco can never deposit into (merkl, yo-protocol, etc.)
+        _all_candidates = candidates
+        candidates = [p for p in candidates if p.get("_depositable")]
+        if not candidates:
+            # Strategy's min_apy filters out depositable pools — search raw cache directly
+            log("  No depositable pools at current APY floor — searching raw pool data...")
+            try:
+                _raw = yield_scanner._pool_cache  # Already fetched this cycle
+                _depositable_candidates = []
+                for p in _raw:
+                    if (p.get("tvlUsd") or 0) < 100_000:
+                        continue
+                    if not p.get("stablecoin"):
+                        continue
+                    p_project = (p.get("project") or "").lower()
+                    p_chain_name = p.get("chain", "")
+                    p_chain_id = CHAIN_MAP_REVERSE.get(p_chain_name, 0)
+                    adapter = protocols.get_adapter(p_project)
+                    if not adapter or not adapter.supports_chain(p_chain_id):
+                        continue
+                    # Only single-asset USDC/USDT/DAI pools
+                    symbol = (p.get("symbol") or "").upper()
+                    if symbol not in ("USDC", "USDT", "DAI", "USDC.E", "USDBC"):
+                        continue
+                    p = {**p, "_depositable": True, "_trusted": True}
+                    p["_risk_score"] = yield_scanner.calc_risk_score(p)
+                    _depositable_candidates.append(p)
+                _depositable_candidates.sort(key=lambda x: -(x.get("apy") or 0))
+                if _depositable_candidates:
+                    candidates = _depositable_candidates[:20]
+                    log(f"  Found {len(candidates)} depositable pools from raw data")
+            except Exception as e:
+                log(f"  Raw pool search failed: {e}")
+        if not candidates:
+            # Last resort — use all candidates but mark non-depositable clearly
+            # so the brain doesn't try to migrate to pools Marco can't deposit into
+            candidates = _all_candidates
+            log("  WARNING: No depositable pools found — showing all candidates for context")
+        else:
+            log(f"  Depositable: {len(candidates)} pools")
+
+        # Sort by sustainable APY
+        candidates.sort(key=lambda p: -(p.get("apyMean30d") or p.get("apy") or 0))
+
         # 5. Build portfolio view using actual position size
         chain_name = CHAIN_MAP.get(current_chain, f"Chain {current_chain}")
         portfolio = {chain_name: {current_token.lower(): position_usd, "native": 0}}
@@ -402,11 +602,22 @@ async def _run_cycle_inner():
         journal_entries.append(entry)
         save_journal(journal_entries)
 
+        # 7b. Initial deposit: if position exists but not deposited, deposit now
+        if (
+            not state.get("_deposited_pool")
+            and state.get("position_usd", 0) > wallet.MIN_POSITION_USD
+            and decision.get("action") != "migrate"
+            and not DEMO_MODE
+        ):
+            log("─── Not deposited — attempting initial deposit ──")
+            await _try_initial_deposit(state, candidates)
+
         # 8. Execute moves if migrating (gate on confidence)
         if decision.get("action") == "migrate" and decision.get("moves") and confidence < confidence_gate:
             log(f"  BLOCKED: confidence {confidence:.0%} < {confidence_gate:.0%} threshold — holding instead")
         elif decision.get("action") == "migrate" and decision.get("moves"):
             # Single-position model: only execute the first move
+            tx_failures = 0  # Circuit breaker: tracks failed TXs this cycle
             for move in decision["moves"][:1]:
                 to_chain_name = move.get("to_chain", "")
                 target_chain_id = CHAIN_MAP_REVERSE.get(to_chain_name)
@@ -585,6 +796,31 @@ async def _run_cycle_inner():
                         wallet.save_state(state)
                         continue
 
+                    # AAR-125: Try atomic bridge+deposit via LI.FI contractCalls
+                    # Single TX: bridge to destination AND deposit into yield pool atomically
+                    # Only for cross-chain bridges (not same-chain swaps, not TWAP)
+                    _used_atomic_deposit = False
+                    if not is_swap and not use_twap:
+                        _atomic_adapter = protocols.get_adapter(target_project)
+                        if _atomic_adapter and _atomic_adapter.supports_chain(target_chain_id):
+                            try:
+                                _to_min_raw = int(fresh_cost.get("to_amount_min", 0) * 10**current_token_decimals) if fresh_cost else 0
+                                if _to_min_raw > 0:
+                                    _dep_contract, _dep_calldata = _atomic_adapter.build_deposit_calldata(
+                                        _to_min_raw, exec_to_token, wallet_addr, target_chain_id
+                                    )
+                                    fresh_quote = await lifi.get_quote_with_deposit(
+                                        client, current_chain, exec_to_chain,
+                                        exec_from_token, exec_to_token, amount_wei, wallet_addr,
+                                        deposit_contract=_dep_contract,
+                                        deposit_calldata=_dep_calldata,
+                                        slippage=effective_slippage, api_key=LIFI_API_KEY,
+                                    )
+                                    _used_atomic_deposit = True
+                                    log(f"  Atomic bridge+deposit: {target_project} on {to_chain_name} in single TX")
+                            except Exception as _ae:
+                                log(f"  Atomic quote unavailable ({_ae.__class__.__name__}) — standard bridge + deposit")
+
                     # AAR-85: TWAP execution — split into chunks for large positions
                     if use_twap:
                         num_chunks = wallet.TWAP_CHUNKS
@@ -620,20 +856,43 @@ async def _run_cycle_inner():
                             }
                             wallet.save_state(state)
 
+                            # Circuit breaker: stop if too many TX failures this cycle
+                            if tx_failures >= 3:
+                                log("  CIRCUIT BREAKER: 3 TX failures this cycle — stopping TWAP")
+                                twap_failed = True
+                                break
+
+                            async def _refetch_chunk_quote():
+                                return await lifi.get_quote(
+                                    client, current_chain, exec_to_chain,
+                                    exec_from_token, exec_to_token, chunk_wei, wallet_addr,
+                                    slippage=effective_slippage, api_key=LIFI_API_KEY,
+                                )
+
                             try:
-                                chunk_result = await lifi.execute_quote(
+                                chunk_result = await lifi.execute_with_retry(
                                     chunk_quote, private_key, rpc_url,
                                     poll_status_client=client, api_key=LIFI_API_KEY,
+                                    refetch_fn=_refetch_chunk_quote,
                                 )
                                 log(f"  TWAP chunk {chunk_i + 1} TX: {chunk_result['tx_hash']} status={chunk_result['status']}")
                                 if chunk_result["status"] == "FAILED":
                                     log(f"  TWAP chunk {chunk_i + 1} FAILED — stopping TWAP")
+                                    tx_failures += 1
                                     twap_failed = True
                                     state.pop("_pending_tx", None)
                                     wallet.save_state(state)
                                     break
+                            except lifi.RetryExhausted as e:
+                                log(f"  TWAP chunk {chunk_i + 1} exhausted retries: {e.last_exc} — stopping TWAP")
+                                tx_failures += 1
+                                twap_failed = True
+                                state.pop("_pending_tx", None)
+                                wallet.save_state(state)
+                                break
                             except Exception as e:
                                 log(f"  TWAP chunk {chunk_i + 1} execution failed: {e} — stopping TWAP")
+                                tx_failures += 1
                                 twap_failed = True
                                 state.pop("_pending_tx", None)
                                 wallet.save_state(state)
@@ -667,19 +926,43 @@ async def _run_cycle_inner():
                         }
                         wallet.save_state(state)
 
+                        # Circuit breaker: stop if too many TX failures this cycle
+                        if tx_failures >= 3:
+                            log("  CIRCUIT BREAKER: 3 TX failures this cycle — skipping migration")
+                            await send_telegram(client, "⚠️ Marco circuit breaker tripped: 3 TX failures in one cycle. Migration paused.")
+                            continue
+
+                        async def _refetch_bridge_quote():
+                            return await lifi.get_quote(
+                                client, current_chain, exec_to_chain,
+                                exec_from_token, exec_to_token, amount_wei, wallet_addr,
+                                slippage=effective_slippage, api_key=LIFI_API_KEY,
+                            )
+
                         try:
-                            tx_result = await lifi.execute_quote(
+                            tx_result = await lifi.execute_with_retry(
                                 fresh_quote, private_key, rpc_url,
                                 poll_status_client=client, api_key=LIFI_API_KEY,
+                                refetch_fn=_refetch_bridge_quote,
                             )
                             log(f"  TX: {tx_result['tx_hash']} status={tx_result['status']}")
                             if tx_result["status"] == "FAILED":
                                 log(f"  Bridge TX FAILED — not recording migration")
+                                tx_failures += 1
                                 state.pop("_pending_tx", None)
                                 wallet.save_state(state)
                                 continue
+                        except lifi.RetryExhausted as e:
+                            log(f"  Bridge exhausted retries: {e.last_exc}")
+                            tx_failures += 1
+                            if tx_failures >= 3:
+                                await send_telegram(client, f"⚠️ Marco circuit breaker tripped: 3 TX failures in one cycle. Last error: {e.last_exc}")
+                            state.pop("_pending_tx", None)
+                            wallet.save_state(state)
+                            continue
                         except Exception as e:
                             log(f"  Bridge execution failed: {e}")
+                            tx_failures += 1
                             state.pop("_pending_tx", None)
                             wallet.save_state(state)
                             continue
@@ -729,7 +1012,6 @@ async def _run_cycle_inner():
                 target_project = (target_pool.get("project") or "").lower()
                 adapter = protocols.get_adapter(target_project)
                 if adapter and adapter.supports_chain(target_chain_id) and not DEMO_MODE:
-                    log(f"  Depositing into {target_project} pool on {to_chain_name}...")
                     try:
                         dest_rpc = lifi.RPC_URLS.get(target_chain_id)
                         if not dest_rpc:
@@ -738,7 +1020,34 @@ async def _run_cycle_inner():
                         from web3 import Web3
                         w3 = Web3(Web3.HTTPProvider(dest_rpc))
                         wallet_info = wallet.load_wallet()
-                        if wallet_info:
+
+                        if _used_atomic_deposit:
+                            # AAR-125: Bridge TX already included pool deposit — verify it landed
+                            log(f"  Atomic deposit used — verifying {target_project} pool balance...")
+                            ok, actual, vmsg = await adapter.verify_deposit(
+                                w3, wallet_addr, target_chain_id, state["position_usd"]
+                            )
+                            if not ok:
+                                log(f"  VERIFY FAILED: {vmsg} — atomic deposit may not have landed")
+                                await send_telegram(
+                                    client,
+                                    f"⚠️ Marco atomic deposit verification failed on {to_chain_name}: {vmsg}. "
+                                    f"Funds on-chain but pool state not updated."
+                                )
+                            else:
+                                log(f"  {vmsg}")
+                                state["_deposited_pool"] = {
+                                    "protocol": target_project,
+                                    "pool_address": adapter.POOL_ADDRESSES.get(target_chain_id, ""),
+                                    "receipt_token": adapter.RECEIPT_TOKENS.get(target_chain_id, ""),
+                                    "deposited_amount": actual,
+                                    "deposited_at": datetime.now().isoformat(),
+                                    "chain_id": target_chain_id,
+                                }
+                                wallet.save_state(state)
+                        elif wallet_info:
+                            # Standard: bridge TX delivered tokens, now deposit separately
+                            log(f"  Depositing into {target_project} pool on {to_chain_name}...")
                             dest_token = target_pool_token if is_swap else "USDC"
                             dest_stable = wallet.STABLECOINS.get((target_chain_id, dest_token))
                             dest_token_addr = dest_stable["address"] if dest_stable else wallet.USDC.get(target_chain_id)
@@ -749,30 +1058,61 @@ async def _run_cycle_inner():
                                 wallet_addr, wallet_info[1], target_chain_id,
                             )
                             log(f"  Deposited ${dep_result.amount_deposited:.2f} into {target_project}: TX {dep_result.tx_hash[:16]}...")
-                            state["_deposited_pool"] = {
-                                "protocol": target_project,
-                                "pool_address": adapter.POOL_ADDRESSES.get(target_chain_id, ""),
-                                "receipt_token": dep_result.receipt_token,
-                                "deposited_amount": dep_result.amount_deposited,
-                                "deposited_at": datetime.now().isoformat(),
-                                "chain_id": target_chain_id,
-                            }
-                            wallet.save_state(state)
+
+                            # Verify deposit landed on-chain before recording state
+                            ok, actual, vmsg = await adapter.verify_deposit(
+                                w3, wallet_addr, target_chain_id, dep_result.amount_deposited
+                            )
+                            if not ok:
+                                log(f"  VERIFY FAILED: {vmsg} — funds on-chain but NOT recorded as deposited")
+                                await send_telegram(
+                                    client,
+                                    f"⚠️ Marco deposit verification failed on {to_chain_name}: {vmsg}. "
+                                    f"Funds are on-chain but state not updated."
+                                )
+                            else:
+                                log(f"  {vmsg}")
+                                state["_deposited_pool"] = {
+                                    "protocol": target_project,
+                                    "pool_address": adapter.POOL_ADDRESSES.get(target_chain_id, ""),
+                                    "receipt_token": dep_result.receipt_token,
+                                    "deposited_amount": actual,  # On-chain verified amount
+                                    "deposited_at": datetime.now().isoformat(),
+                                    "chain_id": target_chain_id,
+                                }
+                                wallet.save_state(state)
                     except Exception as e:
                         log(f"  WARNING: Pool deposit failed: {e} — funds are on-chain but not deposited")
                 elif DEMO_MODE and adapter and adapter.supports_chain(target_chain_id):
                     log(f"  [DEMO] Would deposit into {target_project} pool on {to_chain_name}")
 
-        # 9. Notify
-        telegram_msg = (
-            f"*Marco's Journal*\n"
-            f"_{datetime.now().strftime('%Y-%m-%d %H:%M')}_\n\n"
-            f"{journal_text}\n\n"
-            f"Action: *{decision.get('action', 'hold').upper()}*"
-        )
-        await send_telegram(client, telegram_msg)
+        # 9. Notify (with dedup — skip identical broadcasts)
+        _cur_apy = state.get("current_pool", {}).get("apy", 0) if state.get("current_pool") else 0
+        _best = candidates[0] if candidates else {}
+        _dedup_sig = f"{action}:{round(_cur_apy)}:{_best.get('project','')}:{round(_best.get('apy', 0))}"
 
-        # 10. Webhook notification
+        _should_broadcast = (
+            _dedup_sig != _last_broadcast["sig"]
+            or _last_broadcast["quiet_count"] >= QUIET_CYCLES
+            or action == "MIGRATE"
+            or state.get("_deposited_pool", {}).get("deposited_at", "").startswith(datetime.now().strftime("%Y-%m-%dT%H"))
+        )
+
+        if _should_broadcast:
+            telegram_msg = (
+                f"*Marco's Journal*\n"
+                f"_{datetime.now().strftime('%Y-%m-%d %H:%M')}_\n\n"
+                f"{journal_text}\n\n"
+                f"Action: *{decision.get('action', 'hold').upper()}*"
+            )
+            await send_telegram(client, telegram_msg)
+            _last_broadcast["sig"] = _dedup_sig
+            _last_broadcast["quiet_count"] = 0
+        else:
+            _last_broadcast["quiet_count"] += 1
+            log(f"  Journal unchanged — suppressing broadcast ({_last_broadcast['quiet_count']}/{QUIET_CYCLES} quiet)")
+
+        # 10. Webhook notification (always send — webhooks are for data pipelines)
         await send_webhook(client, {
             "timestamp": datetime.now().isoformat(),
             "action": decision.get("action", "hold"),

@@ -130,6 +130,136 @@ def calc_bridge_cost(quote: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# TX Retry engine — exponential backoff, error classification, circuit support
+# ---------------------------------------------------------------------------
+
+# Delays between attempts (seconds): 5s -> 15s -> 45s (3 retries = 4 total attempts)
+TX_RETRY_DELAYS = (5, 15, 45)
+
+# Error signatures that indicate a transient failure safe to retry
+_RETRYABLE_PATTERNS = (
+    "nonce too low",
+    "nonce has already been used",
+    "replacement transaction underpriced",
+    "transaction underpriced",
+    "max fee per gas less than block base fee",
+    "fee cap less than block base fee",
+    "intrinsic gas too low",
+    "gas required exceeds allowance",
+    "timeout",
+    "timed out",
+    "connection",
+    "rate limit",
+    "too many requests",
+    "temporarily unavailable",
+    "bad gateway",
+    "service unavailable",
+    "execution aborted",
+    "could not transact with/call contract function",
+)
+
+# Error signatures that are unrecoverable — retrying wastes gas or is unsafe
+_FATAL_PATTERNS = (
+    "insufficient funds",
+    "insufficient balance",
+    "execution reverted",
+    "out of gas",
+    "invalid signature",
+    "transfer amount exceeds",
+    "exceeds allowance",
+    "tx simulation reverted",
+    "simulation reverted",
+    "refusing to sign",
+    "refusing to approve",
+    "does not match known lifi",
+    "no known lifi diamond",
+)
+
+
+def _classify_error(exc: Exception) -> str:
+    """Return retryable or fatal based on exception message."""
+    msg = str(exc).lower()
+    for pat in _FATAL_PATTERNS:
+        if pat in msg:
+            return "fatal"
+    for pat in _RETRYABLE_PATTERNS:
+        if pat in msg:
+            return "retryable"
+    return "retryable"  # Default to retryable for unknown errors
+
+
+class RetryExhausted(Exception):
+    """Raised when execute_with_retry exhausts all attempts without success."""
+
+    def __init__(self, message: str, attempts: int, last_exc: Exception):
+        super().__init__(message)
+        self.attempts = attempts
+        self.last_exc = last_exc
+
+
+async def execute_with_retry(
+    quote: dict,
+    private_key: str,
+    rpc_url: str,
+    poll_status_client=None,
+    api_key=None,
+    quote_fetched_at=None,
+    refetch_fn=None,
+) -> dict:
+    """Execute a LI.FI quote with exponential backoff retry.
+
+    Attempts up to 4 times (1 initial + 3 retries) with delays of 5/15/45 seconds.
+    Classifies errors as retryable vs fatal — fatal errors raise immediately.
+    Refetches the quote before each retry (if refetch_fn provided) for fresh gas/route.
+
+    Returns same format as execute_quote: {tx_hash, status, receipt}.
+    FAILED status (TX reverted on-chain) is returned as-is — caller decides.
+    Raises RetryExhausted if all attempts fail due to retryable errors.
+    """
+    import time as _time
+
+    last_exc = None
+    current_quote = quote
+    current_fetched_at = quote_fetched_at
+
+    for attempt in range(len(TX_RETRY_DELAYS) + 1):
+        label = f"attempt {attempt + 1}/{len(TX_RETRY_DELAYS) + 1}"
+        try:
+            result = await execute_quote(
+                current_quote, private_key, rpc_url,
+                poll_status_client=poll_status_client, api_key=api_key,
+                quote_fetched_at=current_fetched_at, refetch_fn=refetch_fn,
+            )
+            return result
+        except Exception as exc:
+            last_exc = exc
+            cls = _classify_error(exc)
+            print(f"[retry] {label} {cls} error: {exc}")
+            if cls == "fatal":
+                raise
+
+            if attempt >= len(TX_RETRY_DELAYS):
+                break
+
+            delay = TX_RETRY_DELAYS[attempt]
+            print(f"[retry] Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+
+            if refetch_fn:
+                try:
+                    current_quote = await refetch_fn()
+                    current_fetched_at = _time.time()
+                except Exception as fe:
+                    print(f"[retry] Quote refetch failed: {fe} — using previous quote")
+
+    raise RetryExhausted(
+        f"TX failed after {len(TX_RETRY_DELAYS) + 1} attempts",
+        attempts=len(TX_RETRY_DELAYS) + 1,
+        last_exc=last_exc,
+    ) from last_exc
+
+
 ERC20_ABI = [
     {
         "inputs": [

@@ -123,6 +123,41 @@ class PoolAdapter(ABC):
             (contract_address, calldata_hex) for use with LI.FI contractCalls
         """
 
+    async def verify_deposit(
+        self,
+        w3: "Web3",
+        wallet_address: str,
+        chain_id: int,
+        expected_usd: float,
+        tolerance: float = 0.005,
+    ) -> tuple[bool, float, str]:
+        """Verify that a deposit TX actually landed: read receipt token balance vs expected.
+
+        Args:
+            expected_usd: Amount we expected to deposit (from DepositResult.amount_deposited)
+            tolerance: Fractional slippage tolerance (default 0.5%)
+
+        Returns:
+            (success, actual_usd, message)
+        """
+        try:
+            actual = await self.balance(w3, wallet_address, chain_id)
+        except Exception as exc:
+            return False, 0.0, f"Balance read failed: {exc}"
+
+        if actual is None or actual == 0:
+            return False, 0.0, "Balance reads 0 — deposit may not have landed on-chain"
+
+        min_expected = expected_usd * (1.0 - tolerance)
+        if actual < min_expected:
+            return (
+                False,
+                actual,
+                f"Received ${actual:.4f} < min expected ${min_expected:.4f} "
+                f"(expected ${expected_usd:.4f}, tolerance {tolerance * 100:.1f}%)",
+            )
+        return True, actual, f"Verified: ${actual:.4f} (expected ${expected_usd:.4f})"
+
     def supports_chain(self, chain_id: int) -> bool:
         return chain_id in self.POOL_ADDRESSES
 
@@ -180,12 +215,14 @@ class PoolAdapter(ABC):
             "chainId": w3.eth.chain_id,
         })
 
-        # EIP-1559
+        # EIP-1559 — handle L2 ultra-low base fees
         try:
             latest = await asyncio.to_thread(w3.eth.get_block, "latest")
-            if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
-                tx["maxFeePerGas"] = latest.baseFeePerGas * 2
-                tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+            if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas is not None:
+                base_fee = max(latest.baseFeePerGas, w3.to_wei(0.1, "gwei"))
+                tx["maxFeePerGas"] = base_fee * 3
+                tip = w3.to_wei(0.05, "gwei")
+                tx["maxPriorityFeePerGas"] = min(tip, tx["maxFeePerGas"])
         except Exception:
             pass
 
@@ -207,16 +244,26 @@ class PoolAdapter(ABC):
         private_key: str,
     ) -> tuple[str, dict]:
         """Sign, send, and wait for a transaction. Returns (tx_hash, receipt)."""
-        # EIP-1559 gas
+        # Always fetch fresh nonce right before signing (handles post-approval race)
+        sender = tx.get("from")
+        if sender:
+            fresh_nonce = await asyncio.to_thread(w3.eth.get_transaction_count, sender, "pending")
+            tx["nonce"] = fresh_nonce
+
+        # EIP-1559 gas — handle L2 ultra-low base fees
         try:
             latest = await asyncio.to_thread(w3.eth.get_block, "latest")
-            if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas:
-                tx["maxFeePerGas"] = latest.baseFeePerGas * 2
+            if hasattr(latest, "baseFeePerGas") and latest.baseFeePerGas is not None:
+                # Floor at 0.1 gwei for L2s where baseFee can be near-zero
+                base_fee = max(latest.baseFeePerGas, w3.to_wei(0.1, "gwei"))
+                tx["maxFeePerGas"] = base_fee * 3
                 try:
                     tip = await asyncio.to_thread(w3.eth.max_priority_fee)
-                    tx["maxPriorityFeePerGas"] = max(w3.to_wei(0.05, "gwei"), min(tip, w3.to_wei(5, "gwei")))
+                    tip = max(w3.to_wei(0.01, "gwei"), min(tip, w3.to_wei(5, "gwei")))
                 except Exception:
-                    tx["maxPriorityFeePerGas"] = w3.to_wei(0.1, "gwei")
+                    tip = w3.to_wei(0.05, "gwei")
+                # Ensure priority fee never exceeds max fee
+                tx["maxPriorityFeePerGas"] = min(tip, tx["maxFeePerGas"])
         except Exception:
             pass
 
@@ -248,10 +295,16 @@ def get_adapter(protocol_slug: str) -> PoolAdapter | None:
     slug = protocol_slug.lower().strip()
     if slug in _registry:
         return _registry[slug]
-    # Fuzzy: try without version suffix
-    base = slug.rsplit("-", 1)[0] if "-v" in slug else slug
+    # Strip common DefiLlama suffixes: -lending, -dex, -earn, etc.
+    base = slug
+    for suffix in ("-lending", "-dex", "-earn", "-finance", "-protocol"):
+        if slug.endswith(suffix):
+            base = slug[: -len(suffix)]
+            break
+    if "-v" in base:
+        base = base.rsplit("-", 1)[0]
     for key, adapter in _registry.items():
-        if key.startswith(base):
+        if key.startswith(base) or base.startswith(key.split("-")[0]):
             return adapter
     return None
 
